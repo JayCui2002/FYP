@@ -1,0 +1,4 @@
+streamdiffusionv2
+numpy
+Pillow
+realesrgan

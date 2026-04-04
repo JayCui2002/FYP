@@ -1,0 +1,4 @@
+[console_scripts]
+streamdiffusionv2-pipe = streamv2v.inference_pipe:main
+streamdiffusionv2-single = streamv2v.inference:main
+streamdiffusionv2-single-wo = streamv2v.inference_wo_batch:main
