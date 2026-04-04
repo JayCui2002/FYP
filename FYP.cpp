@@ -159,14 +159,6 @@ static const char* kSkyFragPath = "input/shader/skybox.frag";
 
 static void drawGltfModel(const GltfModelGpu& model, GLuint modelProgram);
 
-static void logInfo(const std::string& message) {
-    (void)message;
-}
-
-static void logError(const std::string& message) {
-    (void)message;
-}
-
 static void updateLightFromCursor() {
     glm::vec3 forward = glm::normalize(gLookAt - gCameraPos);
     glm::vec3 right = glm::cross(forward, gUp);
@@ -212,7 +204,6 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
     }
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
         gShowStylized = !gShowStylized;
-        logInfo(gShowStylized ? "Display mode switched to stylized output." : "Display mode switched to original OpenGL render.");
         return;
     }
     if (key == GLFW_KEY_R && action == GLFW_PRESS) {
@@ -327,7 +318,6 @@ static std::string quoteArg(const std::string& s) {
 static void launchStreamV2Bridge(const SceneConfig& cfg) {
     if (!cfg.streamV2Autostart) return;
     if (cfg.streamV2Python.empty() || cfg.streamV2Script.empty()) return;
-    logInfo("Launching StreamDiffusionV2 bridge process.");
     std::stringstream cmd;
     cmd << "start \"\" /B "
         << quoteArg(cfg.streamV2Python) << " "
@@ -358,8 +348,7 @@ static bool recvAll(SOCKET sock, unsigned char* data, int size) {
     return true;
 }
 
-static void stopStreamWorker(StreamSharedState* shared, const std::string& reason) {
-    if (!reason.empty()) logError(reason);
+static void stopStreamWorker(StreamSharedState* shared) {
     {
         std::lock_guard<std::mutex> lock(shared->mutex);
         shared->stop = true;
@@ -555,7 +544,6 @@ static void renderSceneToCurrentFramebuffer(
 static SOCKET connectToStreamV2(const SceneConfig& cfg) {
     WSADATA wsaData{};
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return INVALID_SOCKET;
-    logInfo("Waiting for StreamDiffusionV2 socket service.");
     const auto timeout = std::chrono::duration<float>((cfg.streamV2WaitTimeoutSec > 0.0f) ? cfg.streamV2WaitTimeoutSec : 120.0f);
     const auto begin = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - begin < timeout) {
@@ -569,7 +557,6 @@ static SOCKET connectToStreamV2(const SceneConfig& cfg) {
             DWORD timeoutMs = 300000;
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
-            logInfo("Connected to StreamDiffusionV2 socket service.");
             return sock;
         }
         closesocket(sock);
@@ -607,11 +594,11 @@ static void streamSendLoop(SOCKET sock, StreamSharedState* shared) {
         request.payloadSize = static_cast<uint32_t>(input.size());
         request.seq = seq;
         if (!sendAll(sock, reinterpret_cast<const unsigned char*>(&request), sizeof(request))) {
-            stopStreamWorker(shared, "Failed to send the StreamDiffusionV2 request header.");
+            stopStreamWorker(shared);
             return;
         }
         if (!sendAll(sock, input.data(), static_cast<int>(input.size()))) {
-            stopStreamWorker(shared, "Failed to send the StreamDiffusionV2 frame payload.");
+            stopStreamWorker(shared);
             return;
         }
         {
@@ -630,16 +617,16 @@ static void streamReceiveLoop(SOCKET sock, StreamSharedState* shared) {
         }
         StreamResponseHeader response{};
         if (!recvAll(sock, reinterpret_cast<unsigned char*>(&response), sizeof(response))) {
-            stopStreamWorker(shared, "Timed out or failed while waiting for the StreamDiffusionV2 response header.");
+            stopStreamWorker(shared);
             return;
         }
         if (response.magic != kStreamResponseMagic) {
-            stopStreamWorker(shared, "Received an invalid StreamDiffusionV2 response header.");
+            stopStreamWorker(shared);
             return;
         }
         std::vector<unsigned char> output(response.payloadSize);
         if (!recvAll(sock, output.data(), static_cast<int>(output.size()))) {
-            stopStreamWorker(shared, "Timed out or failed while receiving the StreamDiffusionV2 frame payload.");
+            stopStreamWorker(shared);
             return;
         }
         if ((response.flags & kStreamResponseFlagStylizedReady) == 0u) continue;
@@ -981,17 +968,14 @@ static GLuint loadSkyAtlasTexture2D(const std::string& path) {
 int main() {
     SceneConfig config{};
     if (!loadSceneConfig("input/scene.cfg", config)) {
-        logError("Failed to load input/scene.cfg.");
         return 1;
     }
     launchStreamV2Bridge(config);
     SOCKET streamSocket = connectToStreamV2(config);
     if (streamSocket == INVALID_SOCKET) {
-        logError("Failed to connect to the StreamDiffusionV2 socket service.");
         return 1;
     }
     if (!glfwInit()) {
-        logError("Failed to initialize GLFW.");
         return 1;
     }
 
@@ -1001,7 +985,6 @@ int main() {
 
     GLFWwindow* window = glfwCreateWindow(gWindowWidth, gWindowHeight, "OUT FPS: 0 | NEW FPS: 0", nullptr, nullptr);
     if (!window) {
-        logError("Failed to create the GLFW window.");
         glfwTerminate();
         return 1;
     }
@@ -1012,7 +995,6 @@ int main() {
     glfwSetCursorPosCallback(window, cursorPositionCallback);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
     if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
-        logError("Failed to initialize GLAD.");
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;
@@ -1028,7 +1010,6 @@ int main() {
     const char* quadFs = "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform sampler2D uTex;\nvoid main(){FragColor=texture(uTex,vec2(vUv.x,1.0-vUv.y));}";
     GLuint quadProgram = CreateProgramFromSource(quadVs, quadFs);
     if (modelProgram == 0 || shadowProgram == 0 || skyProgram == 0 || quadProgram == 0) {
-        logError("Failed to create one or more shader programs.");
         if (shadowProgram != 0) glDeleteProgram(shadowProgram);
         if (quadProgram != 0) glDeleteProgram(quadProgram);
         glfwDestroyWindow(window);
@@ -1038,7 +1019,6 @@ int main() {
 
     GltfModelGpu modelGpu;
     if (!loadGltfModel(config.modelPath, modelGpu)) {
-        logError("Failed to load the GLTF model.");
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;
@@ -1091,7 +1071,6 @@ int main() {
 
     GLuint skyAtlasTex = loadSkyAtlasTexture2D(config.skyboxAtlasPath);
     if (skyAtlasTex == 0) {
-        logError("Failed to load the skybox atlas texture.");
         cleanupGltfModel(modelGpu);
         glDeleteVertexArrays(1, &skyVAO);
         glDeleteBuffers(1, &skyPosVBO);
@@ -1137,7 +1116,6 @@ int main() {
     CaptureFramebuffer captureFramebuffer{};
     ShadowFramebuffer shadowFramebuffer{};
     if (!initCaptureFramebuffer(captureFramebuffer, config.streamCaptureSide)) {
-        logError("Failed to create the fixed-size capture framebuffer.");
         cleanupGltfModel(modelGpu);
         glDeleteVertexArrays(1, &skyVAO);
         glDeleteBuffers(1, &skyPosVBO);
@@ -1156,7 +1134,6 @@ int main() {
         return 1;
     }
     if (!initShadowFramebuffer(shadowFramebuffer, 1024, 1024)) {
-        logError("Failed to create the shadow framebuffer.");
         cleanupCaptureFramebuffer(captureFramebuffer);
         cleanupGltfModel(modelGpu);
         glDeleteVertexArrays(1, &skyVAO);
