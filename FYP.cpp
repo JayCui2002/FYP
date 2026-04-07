@@ -11,11 +11,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <objidl.h>
+#include <wincodec.h>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -38,6 +39,7 @@
 struct SceneConfig {
     std::string modelPath;
     std::string skyboxAtlasPath;
+    std::string texturePath;
     float streamInputFps = 10.0f;
     bool streamV2Autostart = false;
     std::string streamV2Python = "python";
@@ -46,6 +48,7 @@ struct SceneConfig {
     int streamV2Port = 8765;
     float streamV2WaitTimeoutSec = 120.0f;
     int streamCaptureSide = 512;
+    bool streamV2UseSuperres = false;
 };
 
 struct GltfPrimitiveGpu {
@@ -55,12 +58,19 @@ struct GltfPrimitiveGpu {
     GLuint uvVbo = 0;
     GLuint ebo = 0;
     GLuint baseColorTex = 0;
+    GLuint normalTex = 0;
+    GLuint metallicRoughnessTex = 0;
     glm::vec4 baseColorFactor = glm::vec4(1.0f);
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    float normalScale = 1.0f;
     GLenum mode = GL_TRIANGLES;
     GLsizei vertexCount = 0;
     GLsizei indexCount = 0;
     bool hasIndices = false;
     bool hasBaseColorTexture = false;
+    bool hasNormalTexture = false;
+    bool hasMetallicRoughnessTexture = false;
     bool alphaBlend = false;
     bool doubleSided = false;
 };
@@ -85,9 +95,13 @@ struct ShadowFramebuffer {
     int height = 0;
 };
 
-static int gWindowWidth = 1024;
-static int gWindowHeight = 1024;
-static bool gShowStylized = false;
+static int windowWidth = 1536;
+static int windowHeight = 512;
+static bool showStylized = false;
+static int originalPanelX = 0;
+static int originalPanelY = 0;
+static int originalPanelWidth = 0;
+static int originalPanelHeight = 0;
 
 struct StreamRequestHeader {
     uint32_t magic = 0;
@@ -99,9 +113,12 @@ struct StreamRequestHeader {
 
 struct StreamResponseHeader {
     uint32_t magic = 0;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t payloadSize = 0;
+    uint32_t stylizedWidth = 0;
+    uint32_t stylizedHeight = 0;
+    uint32_t stylizedPayloadSize = 0;
+    uint32_t superresWidth = 0;
+    uint32_t superresHeight = 0;
+    uint32_t superresPayloadSize = 0;
     uint32_t flags = 0;
     uint32_t seq = 0;
 };
@@ -115,15 +132,13 @@ struct StreamPendingInput {
 struct StreamSharedState {
     std::mutex mutex;
     std::deque<StreamPendingInput> pendingInputs;
-    std::vector<unsigned char> latestOutput;
-    int outputWidth = 0;
-    int outputHeight = 0;
+    std::vector<unsigned char> latestStylizedOutput;
+    int stylizedWidth = 0;
+    int stylizedHeight = 0;
+    std::vector<unsigned char> latestSuperresOutput;
+    int superresWidth = 0;
+    int superresHeight = 0;
     uint32_t latestOutputSeq = 0;
-    uint32_t lastSentSeq = 0;
-    uint64_t capturedCount = 0;
-    uint64_t enqueuedCount = 0;
-    uint64_t droppedCount = 0;
-    uint64_t sentCount = 0;
     uint64_t readyCount = 0;
     uint64_t newOutputCount = 0;
     bool hasNewOutput = false;
@@ -134,21 +149,22 @@ static const uint32_t kStreamRequestMagic = 0x304D5246u;
 static const uint32_t kStreamResponseMagic = 0x3054554Fu;
 static const uint32_t kStreamResponseFlagStylizedReady = 1u;
 static const uint32_t kStreamResponseFlagReuseLatest = 2u;
-static constexpr size_t kMaxPendingStreamInputs = 32;
-static constexpr size_t kStreamCaptureBackpressureThreshold = (kMaxPendingStreamInputs * 3u) / 4u;
+static constexpr size_t kMaxPendingStreamInputs = 4;
+static constexpr size_t kStreamCaptureBackpressureThreshold = 2;
+static constexpr float kStreamInputJpegQuality = 0.75f;
 
-static glm::vec3 gLookAt(0.0f, 0.0f, 0.0f);
-static glm::vec3 gUp(0.0f, 1.0f, 0.0f);
-static float gViewAzimuth = 0.0f;
-static float gViewPolar = 0.0f;
-static float gViewDistance = 3.0f;
-static glm::vec3 gCameraPos(0.0f, 0.0f, 3.0f);
-static glm::vec3 gLightPosition(-2.75f, 5.0f, 3.0f);
-static glm::vec3 gLightIntensity(8.0f, 8.0f, 8.0f);
-static float gLightCursorX = 0.0f;
-static float gLightCursorY = 0.0f;
-static float gDefaultViewDistance = 4.0f;
-static float gModelFitScale = 1.0f;
+static glm::vec3 lookat(0.0f, 0.0f, 0.0f);
+static glm::vec3 up(0.0f, 1.0f, 0.0f);
+static float viewAzimuth = 0.0f;
+static float viewPolar = 0.0f;
+static float viewDistance = 3.0f;
+static glm::vec3 eye_center(0.0f, 0.0f, 3.0f);
+static glm::vec3 lightPosition(-2.75f, 5.0f, 3.0f);
+static glm::vec3 lightIntensity(8.0f, 8.0f, 8.0f);
+static float lightCursorX = 0.0f;
+static float lightCursorY = 0.0f;
+static float defaultViewDistance = 4.0f;
+static float modelFitScale = 1.0f;
 
 static const char* kModelVertPath = "input/shader/model.vert";
 static const char* kModelFragPath = "input/shader/model.frag";
@@ -156,44 +172,53 @@ static const char* kShadowVertPath = "input/shader/model_shadow.vert";
 static const char* kShadowFragPath = "input/shader/model_shadow.frag";
 static const char* kSkyVertPath = "input/shader/skybox.vert";
 static const char* kSkyFragPath = "input/shader/skybox.frag";
-
 static void drawGltfModel(const GltfModelGpu& model, GLuint modelProgram);
 
+// Update light target
 static void updateLightFromCursor() {
-    glm::vec3 forward = glm::normalize(gLookAt - gCameraPos);
-    glm::vec3 right = glm::cross(forward, gUp);
+    glm::vec3 forward = glm::normalize(lookat - eye_center);
+    glm::vec3 right = glm::cross(forward, up);
     if (glm::length(right) < 1e-4f) right = glm::vec3(1.0f, 0.0f, 0.0f);
     else right = glm::normalize(right);
     glm::vec3 up = glm::normalize(glm::cross(right, forward));
-    const float scale = glm::max(1.5f, gViewDistance * 1.5f);
-    const glm::vec3 anchor = gCameraPos + forward * gViewDistance;
-    gLightPosition = anchor + right * (gLightCursorX * scale) + up * (gLightCursorY * scale);
+    const float scale = glm::max(1.5f, viewDistance * 1.5f);
+    const glm::vec3 anchor = eye_center + forward * viewDistance;
+    lightPosition = anchor + right * (lightCursorX * scale) + up * (lightCursorY * scale);
 }
 
+// Refresh camera pose
 static void updateCameraFromSpherical() {
     const float maxPolar = glm::radians(85.0f);
-    if (gViewPolar > maxPolar) gViewPolar = maxPolar;
-    if (gViewPolar < -maxPolar) gViewPolar = -maxPolar;
-    if (gViewDistance < 0.8f) gViewDistance = 0.8f;
-    if (gViewDistance > 30.0f) gViewDistance = 30.0f;
+    if (viewPolar > maxPolar) viewPolar = maxPolar;
+    if (viewPolar < -maxPolar) viewPolar = -maxPolar;
+    if (viewDistance < 0.8f) viewDistance = 0.8f;
+    if (viewDistance > 30.0f) viewDistance = 30.0f;
 
-    gCameraPos.x = gViewDistance * std::cos(gViewPolar) * std::cos(gViewAzimuth);
-    gCameraPos.y = gViewDistance * std::sin(gViewPolar);
-    gCameraPos.z = gViewDistance * std::cos(gViewPolar) * std::sin(gViewAzimuth);
+    eye_center.x = viewDistance * std::cos(viewPolar) * std::cos(viewAzimuth);
+    eye_center.y = viewDistance * std::sin(viewPolar);
+    eye_center.z = viewDistance * std::cos(viewPolar) * std::sin(viewAzimuth);
     updateLightFromCursor();
 }
 
-static void cursorPositionCallback(GLFWwindow* window, double xpos, double ypos) {
+// Handle mouse light
+static void cursor_callback(GLFWwindow* window, double xpos, double ypos) {
     (void)window;
-    if (gWindowWidth <= 0 || gWindowHeight <= 0) return;
-    const float nx = static_cast<float>(xpos / static_cast<double>(gWindowWidth));
-    const float ny = static_cast<float>(ypos / static_cast<double>(gWindowHeight));
-    gLightCursorX = nx * 2.0f - 1.0f;
-    gLightCursorY = 1.0f - ny * 2.0f;
+    if (originalPanelWidth <= 0 || originalPanelHeight <= 0) return;
+    if (xpos < static_cast<double>(originalPanelX) ||
+        xpos > static_cast<double>(originalPanelX + originalPanelWidth) ||
+        ypos < static_cast<double>(originalPanelY) ||
+        ypos > static_cast<double>(originalPanelY + originalPanelHeight)) {
+        return;
+    }
+    const float nx = static_cast<float>((xpos - static_cast<double>(originalPanelX)) / static_cast<double>(originalPanelWidth));
+    const float ny = static_cast<float>((ypos - static_cast<double>(originalPanelY)) / static_cast<double>(originalPanelHeight));
+    lightCursorX = nx * 2.0f - 1.0f;
+    lightCursorY = 1.0f - ny * 2.0f;
     updateLightFromCursor();
 }
 
-static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+// Handle keys
+static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     (void)scancode;
     (void)mods;
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
@@ -203,33 +228,35 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
         return;
     }
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
-        gShowStylized = !gShowStylized;
+        showStylized = !showStylized;
         return;
     }
     if (key == GLFW_KEY_R && action == GLFW_PRESS) {
-        gViewAzimuth = 0.0f;
-        gViewPolar = 0.0f;
-        gViewDistance = gDefaultViewDistance;
+        viewAzimuth = 0.0f;
+        viewPolar = 0.0f;
+        viewDistance = defaultViewDistance;
         updateCameraFromSpherical();
         return;
     }
 
-    if (key == GLFW_KEY_LEFT) gViewAzimuth -= 0.05f;
-    if (key == GLFW_KEY_RIGHT) gViewAzimuth += 0.05f;
-    if (key == GLFW_KEY_UP) gViewPolar += 0.05f;
-    if (key == GLFW_KEY_DOWN) gViewPolar -= 0.05f;
-    if (key == GLFW_KEY_W) gViewDistance -= 0.2f;
-    if (key == GLFW_KEY_S) gViewDistance += 0.2f;
+    if (key == GLFW_KEY_LEFT) viewAzimuth -= 0.05f;
+    if (key == GLFW_KEY_RIGHT) viewAzimuth += 0.05f;
+    if (key == GLFW_KEY_UP) viewPolar += 0.05f;
+    if (key == GLFW_KEY_DOWN) viewPolar -= 0.05f;
+    if (key == GLFW_KEY_W) viewDistance -= 0.2f;
+    if (key == GLFW_KEY_S) viewDistance += 0.2f;
     updateCameraFromSpherical();
 }
 
-static void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
+// Track framebuffer size
+static void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     (void)window;
-    gWindowWidth = width;
-    gWindowHeight = height;
+    windowWidth = width;
+    windowHeight = height;
     glViewport(0, 0, width, height);
 }
 
+// Trim config text
 static std::string trim(const std::string& s) {
     size_t begin = 0;
     while (begin < s.size() && std::isspace(static_cast<unsigned char>(s[begin]))) begin++;
@@ -238,6 +265,7 @@ static std::string trim(const std::string& s) {
     return s.substr(begin, end - begin);
 }
 
+// Split quoted args
 static std::vector<std::string> splitArgsPreservingQuotes(const std::string& args) {
     std::vector<std::string> tokens;
     std::string current;
@@ -260,6 +288,16 @@ static std::vector<std::string> splitArgsPreservingQuotes(const std::string& arg
     return tokens;
 }
 
+// Check arg flag
+static bool hasFlagArg(const std::string& args, const std::string& key) {
+    const std::vector<std::string> tokens = splitArgsPreservingQuotes(args);
+    for (const std::string& token : tokens) {
+        if (token == key) return true;
+    }
+    return false;
+}
+
+// Read int arg
 static int extractIntArgValue(const std::string& args, const std::string& key, int fallbackValue) {
     const std::vector<std::string> tokens = splitArgsPreservingQuotes(args);
     for (size_t i = 0; i < tokens.size(); ++i) {
@@ -282,39 +320,55 @@ static int extractIntArgValue(const std::string& args, const std::string& key, i
     return fallbackValue;
 }
 
+// Load scene config
 static bool loadSceneConfig(const std::string& filePath, SceneConfig& cfg) {
     std::ifstream in(filePath);
     if (!in.is_open()) return false;
 
-    std::unordered_map<std::string, std::string> kv;
     std::string line;
     while (std::getline(in, line)) {
         line = trim(line);
         if (line.empty() || line[0] == '#') continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-        kv[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
+        const std::string key = trim(line.substr(0, eq));
+        const std::string value = trim(line.substr(eq + 1));
+        if (key == "model") {
+            cfg.modelPath = value;
+        } else if (key == "skybox_atlas") {
+            cfg.skyboxAtlasPath = value;
+        } else if (key == "texture") {
+            cfg.texturePath = value;
+        } else if (key == "stream_input_fps") {
+            cfg.streamInputFps = std::stof(value);
+        } else if (key == "stream_v2_autostart") {
+            cfg.streamV2Autostart = (value == "1" || value == "true" || value == "TRUE");
+        } else if (key == "stream_v2_python") {
+            cfg.streamV2Python = value;
+        } else if (key == "stream_v2_script") {
+            cfg.streamV2Script = value;
+        } else if (key == "stream_v2_args") {
+            cfg.streamV2Args = value;
+        } else if (key == "stream_v2_port") {
+            cfg.streamV2Port = std::stoi(value);
+        } else if (key == "stream_v2_wait_timeout_sec") {
+            cfg.streamV2WaitTimeoutSec = std::stof(value);
+        }
     }
 
-    cfg.modelPath = kv["model"];
-    cfg.skyboxAtlasPath = kv["skybox_atlas"];
-    if (kv.count("stream_input_fps") > 0) cfg.streamInputFps = std::stof(kv["stream_input_fps"]);
-    if (kv.count("stream_v2_autostart") > 0) cfg.streamV2Autostart = (kv["stream_v2_autostart"] == "1" || kv["stream_v2_autostart"] == "true" || kv["stream_v2_autostart"] == "TRUE");
-    if (kv.count("stream_v2_python") > 0) cfg.streamV2Python = kv["stream_v2_python"];
-    if (kv.count("stream_v2_script") > 0) cfg.streamV2Script = kv["stream_v2_script"];
-    if (kv.count("stream_v2_args") > 0) cfg.streamV2Args = kv["stream_v2_args"];
-    if (kv.count("stream_v2_port") > 0) cfg.streamV2Port = std::stoi(kv["stream_v2_port"]);
-    if (kv.count("stream_v2_wait_timeout_sec") > 0) cfg.streamV2WaitTimeoutSec = std::stof(kv["stream_v2_wait_timeout_sec"]);
+    cfg.streamV2UseSuperres = hasFlagArg(cfg.streamV2Args, "--sr");
     const int streamWidth = extractIntArgValue(cfg.streamV2Args, "--width", 512);
     const int streamHeight = extractIntArgValue(cfg.streamV2Args, "--height", 512);
     cfg.streamCaptureSide = std::max(64, std::min(streamWidth, streamHeight));
     return !cfg.modelPath.empty() && !cfg.skyboxAtlasPath.empty();
 }
 
+// Quote shell arg
 static std::string quoteArg(const std::string& s) {
     return "\"" + s + "\"";
 }
 
+// Launch bridge process
 static void launchStreamV2Bridge(const SceneConfig& cfg) {
     if (!cfg.streamV2Autostart) return;
     if (cfg.streamV2Python.empty() || cfg.streamV2Script.empty()) return;
@@ -328,6 +382,7 @@ static void launchStreamV2Bridge(const SceneConfig& cfg) {
     std::system(cmd.str().c_str());
 }
 
+// Send socket bytes
 static bool sendAll(SOCKET sock, const unsigned char* data, int size) {
     int sent = 0;
     while (sent < size) {
@@ -338,6 +393,7 @@ static bool sendAll(SOCKET sock, const unsigned char* data, int size) {
     return true;
 }
 
+// Receive socket bytes
 static bool recvAll(SOCKET sock, unsigned char* data, int size) {
     int received = 0;
     while (received < size) {
@@ -348,6 +404,78 @@ static bool recvAll(SOCKET sock, unsigned char* data, int size) {
     return true;
 }
 
+// Release COM pointer
+template <typename T>
+static void releaseCom(T*& ptr) {
+    if (ptr != nullptr) {
+        ptr->Release();
+        ptr = nullptr;
+    }
+}
+
+// Encode input jpeg
+static bool encodeJpegRgb(const unsigned char* rgb, int width, int height, std::vector<unsigned char>& outJpeg) {
+    outJpeg.clear();
+    if (rgb == nullptr || width <= 0 || height <= 0) return false;
+
+    IStream* stream = nullptr;
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* props = nullptr;
+    bool ok = false;
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+    STATSTG stat{};
+    LARGE_INTEGER origin{};
+    ULONG readBytes = 0;
+
+    std::vector<unsigned char> bgr(static_cast<size_t>(width) * static_cast<size_t>(height) * 3u);
+    for (size_t i = 0; i < bgr.size(); i += 3u) {
+        bgr[i + 0] = rgb[i + 2];
+        bgr[i + 1] = rgb[i + 1];
+        bgr[i + 2] = rgb[i + 0];
+    }
+
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) goto cleanup;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) goto cleanup;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder))) goto cleanup;
+    if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache))) goto cleanup;
+    if (FAILED(encoder->CreateNewFrame(&frame, &props))) goto cleanup;
+    if (props != nullptr) {
+        PROPBAG2 option{};
+        option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT value{};
+        VariantInit(&value);
+        value.vt = VT_R4;
+        value.fltVal = kStreamInputJpegQuality;
+        props->Write(1, &option, &value);
+        VariantClear(&value);
+    }
+    if (FAILED(frame->Initialize(props))) goto cleanup;
+    if (FAILED(frame->SetSize(static_cast<UINT>(width), static_cast<UINT>(height)))) goto cleanup;
+    if (FAILED(frame->SetPixelFormat(&format))) goto cleanup;
+    if (FAILED(frame->WritePixels(static_cast<UINT>(height), static_cast<UINT>(width * 3), static_cast<UINT>(bgr.size()), bgr.data()))) goto cleanup;
+    if (FAILED(frame->Commit())) goto cleanup;
+    if (FAILED(encoder->Commit())) goto cleanup;
+
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) goto cleanup;
+    if (stat.cbSize.QuadPart <= 0) goto cleanup;
+    outJpeg.resize(static_cast<size_t>(stat.cbSize.QuadPart));
+    if (FAILED(stream->Seek(origin, STREAM_SEEK_SET, nullptr))) goto cleanup;
+    if (FAILED(stream->Read(outJpeg.data(), static_cast<ULONG>(outJpeg.size()), &readBytes))) goto cleanup;
+    ok = (readBytes == outJpeg.size());
+
+cleanup:
+    releaseCom(props);
+    releaseCom(frame);
+    releaseCom(encoder);
+    releaseCom(factory);
+    releaseCom(stream);
+    if (!ok) outJpeg.clear();
+    return ok;
+}
+
+// Stop stream worker
 static void stopStreamWorker(StreamSharedState* shared) {
     {
         std::lock_guard<std::mutex> lock(shared->mutex);
@@ -355,6 +483,7 @@ static void stopStreamWorker(StreamSharedState* shared) {
     }
 }
 
+// Create capture target
 static bool initCaptureFramebuffer(CaptureFramebuffer& capture, int side) {
     if (side <= 0) return false;
     capture.side = side;
@@ -380,6 +509,7 @@ static bool initCaptureFramebuffer(CaptureFramebuffer& capture, int side) {
     return ok;
 }
 
+// Release capture target
 static void cleanupCaptureFramebuffer(CaptureFramebuffer& capture) {
     if (capture.depthRbo != 0) glDeleteRenderbuffers(1, &capture.depthRbo);
     if (capture.colorTex != 0) glDeleteTextures(1, &capture.colorTex);
@@ -387,6 +517,7 @@ static void cleanupCaptureFramebuffer(CaptureFramebuffer& capture) {
     capture = {};
 }
 
+// Create shadow target
 static bool initShadowFramebuffer(ShadowFramebuffer& shadow, int width, int height) {
     if (width <= 0 || height <= 0) return false;
     shadow.width = width;
@@ -413,12 +544,14 @@ static bool initShadowFramebuffer(ShadowFramebuffer& shadow, int width, int heig
     return ok;
 }
 
+// Release shadow target
 static void cleanupShadowFramebuffer(ShadowFramebuffer& shadow) {
     if (shadow.depthTex != 0) glDeleteTextures(1, &shadow.depthTex);
     if (shadow.fbo != 0) glDeleteFramebuffers(1, &shadow.fbo);
     shadow = {};
 }
 
+// Build light matrix
 static glm::mat4 computeLightSpaceMatrix(const GltfModelGpu& modelGpu, const glm::mat4& modelMatrix, const glm::vec3& lightPosition) {
     const glm::vec3 sceneCenter = glm::vec3(modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
     glm::vec3 lightDir = sceneCenter - lightPosition;
@@ -428,7 +561,7 @@ static glm::mat4 computeLightSpaceMatrix(const GltfModelGpu& modelGpu, const glm
         ? glm::vec3(0.0f, 0.0f, 1.0f)
         : glm::vec3(0.0f, 1.0f, 0.0f);
     const glm::mat4 lightView = glm::lookAt(lightPosition, sceneCenter, lightUp);
-    const float sceneRadius = glm::max(1.5f, modelGpu.radius * gModelFitScale * 2.5f);
+    const float sceneRadius = glm::max(1.5f, modelGpu.radius * modelFitScale * 2.5f);
     const float lightDistance = glm::max(0.1f, glm::distance(lightPosition, sceneCenter));
     const float orthoSize = glm::max(sceneRadius * 2.0f, lightDistance * 0.75f);
     const float nearPlane = glm::max(0.1f, lightDistance - sceneRadius * 4.0f);
@@ -437,6 +570,7 @@ static glm::mat4 computeLightSpaceMatrix(const GltfModelGpu& modelGpu, const glm
     return lightProjection * lightView;
 }
 
+// Render shadow pass
 static void renderShadowMap(
     const GltfModelGpu& modelGpu,
     GLuint shadowProgram,
@@ -454,6 +588,7 @@ static void renderShadowMap(
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+// Read capture frame
 static bool captureFrameFromFramebuffer(const CaptureFramebuffer& capture, std::vector<unsigned char>& outRgb, int& outSide) {
     if (capture.fbo == 0 || capture.side <= 0) return false;
 
@@ -479,6 +614,7 @@ static bool captureFrameFromFramebuffer(const CaptureFramebuffer& capture, std::
     return true;
 }
 
+// Upload output texture
 static void updateStylizedTextureFromMemory(const std::vector<unsigned char>& rgb, int width, int height, GLuint texture) {
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -488,6 +624,23 @@ static void updateStylizedTextureFromMemory(const std::vector<unsigned char>& rg
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
 }
 
+// Draw panel quad
+static void drawTexturePanel(GLuint quadProgram, GLuint quadVAO, GLuint texture, int x, int y, int width, int height) {
+    if (texture == 0 || width <= 0 || height <= 0) return;
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glViewport(x, y, width, height);
+    glUseProgram(quadProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glBindVertexArray(quadVAO);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, reinterpret_cast<void*>(0));
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+}
+
+// Render scene pass
 static void renderSceneToCurrentFramebuffer(
     const GltfModelGpu& modelGpu,
     GLuint modelProgram,
@@ -500,12 +653,17 @@ static void renderSceneToCurrentFramebuffer(
     const glm::mat4& lightSpaceMatrix,
     const glm::vec3& lightPosition,
     const glm::vec3& lightIntensity,
+    int viewportX,
+    int viewportY,
     int viewportWidth,
-    int viewportHeight
+    int viewportHeight,
+    bool clearBuffers
 ) {
-    glViewport(0, 0, viewportWidth, viewportHeight);
-    glClearColor(0.08f, 0.1f, 0.12f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+    if (clearBuffers) {
+        glClearColor(0.08f, 0.1f, 0.12f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
 
     const float aspect = (viewportHeight != 0) ? static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight) : 1.0f;
     const glm::mat4 proj = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 100.0f);
@@ -514,12 +672,15 @@ static void renderSceneToCurrentFramebuffer(
     glUseProgram(modelProgram);
     glUniform1i(glGetUniformLocation(modelProgram, "uBaseColorTex"), 0);
     glUniform1i(glGetUniformLocation(modelProgram, "shadowMap"), 1);
+    glUniform1i(glGetUniformLocation(modelProgram, "uNormalTex"), 2);
+    glUniform1i(glGetUniformLocation(modelProgram, "uMetallicRoughnessTex"), 3);
     const glm::mat4 mvp = proj * view * modelMatrix;
     glUniformMatrix4fv(glGetUniformLocation(modelProgram, "MVP"), 1, GL_FALSE, glm::value_ptr(mvp));
     glUniformMatrix4fv(glGetUniformLocation(modelProgram, "modelMatrix"), 1, GL_FALSE, glm::value_ptr(modelMatrix));
     glUniformMatrix4fv(glGetUniformLocation(modelProgram, "lightSpaceMatrix"), 1, GL_FALSE, glm::value_ptr(lightSpaceMatrix));
     glUniform3fv(glGetUniformLocation(modelProgram, "lightPosition"), 1, glm::value_ptr(lightPosition));
     glUniform3fv(glGetUniformLocation(modelProgram, "lightIntensity"), 1, glm::value_ptr(lightIntensity));
+    glUniform3fv(glGetUniformLocation(modelProgram, "cameraPosition"), 1, glm::value_ptr(eye_center));
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, shadowMapTex);
     drawGltfModel(modelGpu, modelProgram);
@@ -541,6 +702,7 @@ static void renderSceneToCurrentFramebuffer(
     glEnable(GL_CULL_FACE);
 }
 
+// Connect stream socket
 static SOCKET connectToStreamV2(const SceneConfig& cfg) {
     WSADATA wsaData{};
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return INVALID_SOCKET;
@@ -566,9 +728,13 @@ static SOCKET connectToStreamV2(const SceneConfig& cfg) {
     return INVALID_SOCKET;
 }
 
+// Send stream frames
 static void streamSendLoop(SOCKET sock, StreamSharedState* shared) {
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool comInitialized = SUCCEEDED(comResult) || comResult == S_FALSE;
     while (true) {
         std::vector<unsigned char> input;
+        std::vector<unsigned char> payload;
         int side = 0;
         uint32_t seq = 0;
         {
@@ -587,28 +753,31 @@ static void streamSendLoop(SOCKET sock, StreamSharedState* shared) {
             continue;
         }
 
+        if (!comInitialized || !encodeJpegRgb(input.data(), side, side, payload)) {
+            payload = std::move(input);
+        }
+
         StreamRequestHeader request{};
         request.magic = kStreamRequestMagic;
         request.width = static_cast<uint32_t>(side);
         request.height = static_cast<uint32_t>(side);
-        request.payloadSize = static_cast<uint32_t>(input.size());
+        request.payloadSize = static_cast<uint32_t>(payload.size());
         request.seq = seq;
         if (!sendAll(sock, reinterpret_cast<const unsigned char*>(&request), sizeof(request))) {
             stopStreamWorker(shared);
+            if (comInitialized) CoUninitialize();
             return;
         }
-        if (!sendAll(sock, input.data(), static_cast<int>(input.size()))) {
+        if (!sendAll(sock, payload.data(), static_cast<int>(payload.size()))) {
             stopStreamWorker(shared);
+            if (comInitialized) CoUninitialize();
             return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(shared->mutex);
-            shared->lastSentSeq = seq;
-            ++shared->sentCount;
         }
     }
+    if (comInitialized) CoUninitialize();
 }
 
+// Receive stream frames
 static void streamReceiveLoop(SOCKET sock, StreamSharedState* shared) {
     while (true) {
         {
@@ -624,8 +793,13 @@ static void streamReceiveLoop(SOCKET sock, StreamSharedState* shared) {
             stopStreamWorker(shared);
             return;
         }
-        std::vector<unsigned char> output(response.payloadSize);
-        if (!recvAll(sock, output.data(), static_cast<int>(output.size()))) {
+        std::vector<unsigned char> stylizedOutput(response.stylizedPayloadSize);
+        if (!recvAll(sock, stylizedOutput.data(), static_cast<int>(stylizedOutput.size()))) {
+            stopStreamWorker(shared);
+            return;
+        }
+        std::vector<unsigned char> superresOutput(response.superresPayloadSize);
+        if (!recvAll(sock, superresOutput.data(), static_cast<int>(superresOutput.size()))) {
             stopStreamWorker(shared);
             return;
         }
@@ -633,13 +807,15 @@ static void streamReceiveLoop(SOCKET sock, StreamSharedState* shared) {
         {
             std::lock_guard<std::mutex> lock(shared->mutex);
             ++shared->readyCount;
-            const bool hasPayload = response.payloadSize > 0u;
-            const bool reuseLatest = (response.flags & kStreamResponseFlagReuseLatest) != 0u;
+            const bool hasPayload = response.stylizedPayloadSize > 0u;
             if (hasPayload) {
                 if (response.seq < shared->latestOutputSeq) continue;
-                shared->latestOutput = std::move(output);
-                shared->outputWidth = static_cast<int>(response.width);
-                shared->outputHeight = static_cast<int>(response.height);
+                shared->latestStylizedOutput = std::move(stylizedOutput);
+                shared->stylizedWidth = static_cast<int>(response.stylizedWidth);
+                shared->stylizedHeight = static_cast<int>(response.stylizedHeight);
+                shared->latestSuperresOutput = std::move(superresOutput);
+                shared->superresWidth = static_cast<int>(response.superresWidth);
+                shared->superresHeight = static_cast<int>(response.superresHeight);
                 shared->latestOutputSeq = response.seq;
                 ++shared->newOutputCount;
                 shared->hasNewOutput = true;
@@ -648,6 +824,7 @@ static void streamReceiveLoop(SOCKET sock, StreamSharedState* shared) {
     }
 }
 
+// Copy vec3 accessor
 static bool copyAccessorVec3(const tinygltf::Model& model, int accessorIndex, std::vector<float>& outData) {
     if (accessorIndex < 0 || accessorIndex >= static_cast<int>(model.accessors.size())) return false;
     const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
@@ -668,6 +845,7 @@ static bool copyAccessorVec3(const tinygltf::Model& model, int accessorIndex, st
     return true;
 }
 
+// Copy vec2 accessor
 static bool copyAccessorVec2(const tinygltf::Model& model, int accessorIndex, std::vector<float>& outData) {
     if (accessorIndex < 0 || accessorIndex >= static_cast<int>(model.accessors.size())) return false;
     const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
@@ -687,6 +865,7 @@ static bool copyAccessorVec2(const tinygltf::Model& model, int accessorIndex, st
     return true;
 }
 
+// Copy index data
 static bool copyIndicesAsUint(const tinygltf::Model& model, int accessorIndex, std::vector<unsigned int>& outIndices) {
     if (accessorIndex < 0 || accessorIndex >= static_cast<int>(model.accessors.size())) return false;
     const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
@@ -712,6 +891,7 @@ static bool copyIndicesAsUint(const tinygltf::Model& model, int accessorIndex, s
     return true;
 }
 
+// Upload texture data
 static GLuint uploadTexture2D(const unsigned char* pixels, int width, int height, int components) {
     if (!pixels || width <= 0 || height <= 0 || components <= 0) return 0;
 
@@ -727,6 +907,10 @@ static GLuint uploadTexture2D(const unsigned char* pixels, int width, int height
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    if (components == 1) {
+        GLint swizzleMask[] = {GL_RED, GL_RED, GL_RED, GL_ONE};
+        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleMask);
+    }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(
         GL_TEXTURE_2D,
@@ -742,14 +926,32 @@ static GLuint uploadTexture2D(const unsigned char* pixels, int width, int height
     return texId;
 }
 
-static GLuint loadGltfBaseColorTexture(
+// Load texture file
+static GLuint loadTexture2DFromFile(const std::string& path, GLint wrapS, GLint wrapT) {
+    int width = 0;
+    int height = 0;
+    int components = 0;
+    stbi_set_flip_vertically_on_load(false);
+    unsigned char* pixels = stbi_load(path.c_str(), &width, &height, &components, 0);
+    if (!pixels) return 0;
+
+    const GLuint texId = uploadTexture2D(pixels, width, height, components);
+    stbi_image_free(pixels);
+    if (texId == 0) return 0;
+
+    glBindTexture(GL_TEXTURE_2D, texId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+    return texId;
+}
+
+// Load gltf image
+static GLuint loadGltfTextureImage(
     const tinygltf::Model& model,
-    int materialIndex,
-    const std::filesystem::path& modelDir
+    int textureIndex,
+    const std::filesystem::path& modelDir,
+    const std::filesystem::path& textureRootDir
 ) {
-    if (materialIndex < 0 || materialIndex >= static_cast<int>(model.materials.size())) return 0;
-    const tinygltf::Material& material = model.materials[static_cast<size_t>(materialIndex)];
-    const int textureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
     if (textureIndex < 0 || textureIndex >= static_cast<int>(model.textures.size())) return 0;
     const tinygltf::Texture& texture = model.textures[static_cast<size_t>(textureIndex)];
     const int imageIndex = texture.source;
@@ -760,25 +962,70 @@ static GLuint loadGltfBaseColorTexture(
     }
 
     if (!image.uri.empty()) {
-        const std::filesystem::path texturePath = modelDir / std::filesystem::path(image.uri);
-        int width = 0;
-        int height = 0;
-        int components = 0;
-        stbi_set_flip_vertically_on_load(false);
-        unsigned char* pixels = stbi_load(texturePath.string().c_str(), &width, &height, &components, 0);
-        if (pixels) {
+        const std::filesystem::path imagePath = std::filesystem::path(image.uri);
+        std::vector<std::filesystem::path> candidates;
+        candidates.push_back(modelDir / imagePath);
+        if (!textureRootDir.empty()) {
+            candidates.push_back(textureRootDir / imagePath);
+            candidates.push_back(textureRootDir / imagePath.filename());
+        }
+
+        for (const auto& texturePath : candidates) {
+            int width = 0;
+            int height = 0;
+            int components = 0;
+            stbi_set_flip_vertically_on_load(false);
+            unsigned char* pixels = stbi_load(texturePath.string().c_str(), &width, &height, &components, 0);
+            if (!pixels) continue;
+
             const GLuint texId = uploadTexture2D(pixels, width, height, components);
             stbi_image_free(pixels);
-            return texId;
+            if (texId != 0) return texId;
         }
-        (void)texturePath;
-        (void)material;
     }
 
     return 0;
 }
 
-static bool loadGltfModel(const std::string& path, GltfModelGpu& outModel) {
+// Load base color
+static GLuint loadGltfBaseColorTexture(
+    const tinygltf::Model& model,
+    int materialIndex,
+    const std::filesystem::path& modelDir,
+    const std::filesystem::path& textureRootDir
+) {
+    if (materialIndex < 0 || materialIndex >= static_cast<int>(model.materials.size())) return 0;
+    const tinygltf::Material& material = model.materials[static_cast<size_t>(materialIndex)];
+    const int textureIndex = material.pbrMetallicRoughness.baseColorTexture.index;
+    return loadGltfTextureImage(model, textureIndex, modelDir, textureRootDir);
+}
+
+// Load normal map
+static GLuint loadGltfNormalTexture(
+    const tinygltf::Model& model,
+    int materialIndex,
+    const std::filesystem::path& modelDir,
+    const std::filesystem::path& textureRootDir
+) {
+    if (materialIndex < 0 || materialIndex >= static_cast<int>(model.materials.size())) return 0;
+    const tinygltf::Material& material = model.materials[static_cast<size_t>(materialIndex)];
+    return loadGltfTextureImage(model, material.normalTexture.index, modelDir, textureRootDir);
+}
+
+// Load roughness map
+static GLuint loadGltfMetallicRoughnessTexture(
+    const tinygltf::Model& model,
+    int materialIndex,
+    const std::filesystem::path& modelDir,
+    const std::filesystem::path& textureRootDir
+) {
+    if (materialIndex < 0 || materialIndex >= static_cast<int>(model.materials.size())) return 0;
+    const tinygltf::Material& material = model.materials[static_cast<size_t>(materialIndex)];
+    return loadGltfTextureImage(model, material.pbrMetallicRoughness.metallicRoughnessTexture.index, modelDir, textureRootDir);
+}
+
+// Load gltf model
+static bool loadGltfModel(const std::string& path, const std::string& textureRootPath, GltfModelGpu& outModel) {
     tinygltf::TinyGLTF loader;
     tinygltf::Model model;
     std::string err;
@@ -789,15 +1036,17 @@ static bool loadGltfModel(const std::string& path, GltfModelGpu& outModel) {
     bool ok = isGlb ? loader.LoadBinaryFromFile(&model, &err, &warn, path)
                     : loader.LoadASCIIFromFile(&model, &err, &warn, path);
     (void)warn;
-    (void)err;
-    if (!ok) return false;
+    if (!ok) {
+        return false;
+    }
 
     const std::filesystem::path modelDir = std::filesystem::path(path).parent_path();
+    const std::filesystem::path textureRootDir = textureRootPath.empty()
+        ? std::filesystem::path()
+        : std::filesystem::path(textureRootPath);
     outModel.primitives.clear();
     bool hasBounds = false;
     glm::vec3 minP(0.0f), maxP(0.0f);
-    size_t primitiveIndex = 0;
-
     for (const auto& mesh : model.meshes) {
         for (const auto& primitive : mesh.primitives) {
             auto itPos = primitive.attributes.find("POSITION");
@@ -848,6 +1097,9 @@ static bool loadGltfModel(const std::string& path, GltfModelGpu& outModel) {
                         static_cast<float>(factor[3])
                     );
                 }
+                gpu.metallicFactor = static_cast<float>(material.pbrMetallicRoughness.metallicFactor);
+                gpu.roughnessFactor = static_cast<float>(material.pbrMetallicRoughness.roughnessFactor);
+                gpu.normalScale = static_cast<float>(material.normalTexture.scale);
             }
 
             glGenVertexArrays(1, &gpu.vao);
@@ -871,15 +1123,13 @@ static bool loadGltfModel(const std::string& path, GltfModelGpu& outModel) {
                 glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(uvs.size() * sizeof(float)), uvs.data(), GL_STATIC_DRAW);
                 glEnableVertexAttribArray(2);
                 glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, reinterpret_cast<void*>(0));
-                gpu.baseColorTex = loadGltfBaseColorTexture(model, primitive.material, modelDir);
+                gpu.baseColorTex = loadGltfBaseColorTexture(model, primitive.material, modelDir, textureRootDir);
                 gpu.hasBaseColorTexture = (gpu.baseColorTex != 0);
+                gpu.normalTex = loadGltfNormalTexture(model, primitive.material, modelDir, textureRootDir);
+                gpu.hasNormalTexture = (gpu.normalTex != 0);
+                gpu.metallicRoughnessTex = loadGltfMetallicRoughnessTexture(model, primitive.material, modelDir, textureRootDir);
+                gpu.hasMetallicRoughnessTexture = (gpu.metallicRoughnessTex != 0);
             }
-
-            std::string materialName = "<none>";
-            if (primitive.material >= 0 && primitive.material < static_cast<int>(model.materials.size())) {
-                materialName = model.materials[static_cast<size_t>(primitive.material)].name;
-            }
-            ++primitiveIndex;
 
             if (primitive.indices >= 0) {
                 std::vector<unsigned int> indices;
@@ -902,13 +1152,22 @@ static bool loadGltfModel(const std::string& path, GltfModelGpu& outModel) {
         outModel.center = (minP + maxP) * 0.5f;
         outModel.radius = glm::max(0.001f, glm::length(maxP - minP) * 0.5f);
     }
-    return !outModel.primitives.empty();
+    if (outModel.primitives.empty()) {
+        return false;
+    }
+    return true;
 }
 
+// Draw gltf model
 static void drawGltfModel(const GltfModelGpu& model, GLuint modelProgram) {
     for (const auto& primitive : model.primitives) {
         glUniform4fv(glGetUniformLocation(modelProgram, "uBaseColorFactor"), 1, glm::value_ptr(primitive.baseColorFactor));
         glUniform1i(glGetUniformLocation(modelProgram, "uUseBaseColorTex"), primitive.hasBaseColorTexture ? 1 : 0);
+        glUniform1i(glGetUniformLocation(modelProgram, "uUseNormalTex"), primitive.hasNormalTexture ? 1 : 0);
+        glUniform1i(glGetUniformLocation(modelProgram, "uUseMetallicRoughnessTex"), primitive.hasMetallicRoughnessTexture ? 1 : 0);
+        glUniform1f(glGetUniformLocation(modelProgram, "uMetallicFactor"), primitive.metallicFactor);
+        glUniform1f(glGetUniformLocation(modelProgram, "uRoughnessFactor"), primitive.roughnessFactor);
+        glUniform1f(glGetUniformLocation(modelProgram, "uNormalScale"), primitive.normalScale);
         if (primitive.alphaBlend) {
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -924,6 +1183,20 @@ static void drawGltfModel(const GltfModelGpu& model, GLuint modelProgram) {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, 0);
         }
+        if (primitive.hasNormalTexture && primitive.normalTex != 0) {
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, primitive.normalTex);
+        } else {
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        if (primitive.hasMetallicRoughnessTexture && primitive.metallicRoughnessTex != 0) {
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, primitive.metallicRoughnessTex);
+        } else {
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
         glBindVertexArray(primitive.vao);
         if (primitive.hasIndices) glDrawElements(primitive.mode, primitive.indexCount, GL_UNSIGNED_INT, reinterpret_cast<void*>(0));
         else glDrawArrays(primitive.mode, 0, primitive.vertexCount);
@@ -931,8 +1204,14 @@ static void drawGltfModel(const GltfModelGpu& model, GLuint modelProgram) {
     glBindVertexArray(0);
     glDisable(GL_BLEND);
     glEnable(GL_CULL_FACE);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
 }
 
+// Release gltf model
 static void cleanupGltfModel(GltfModelGpu& model) {
     for (auto& primitive : model.primitives) {
         if (primitive.ebo != 0) glDeleteBuffers(1, &primitive.ebo);
@@ -940,95 +1219,113 @@ static void cleanupGltfModel(GltfModelGpu& model) {
         if (primitive.posVbo != 0) glDeleteBuffers(1, &primitive.posVbo);
         if (primitive.normalVbo != 0) glDeleteBuffers(1, &primitive.normalVbo);
         if (primitive.baseColorTex != 0) glDeleteTextures(1, &primitive.baseColorTex);
+        if (primitive.normalTex != 0) glDeleteTextures(1, &primitive.normalTex);
+        if (primitive.metallicRoughnessTex != 0) glDeleteTextures(1, &primitive.metallicRoughnessTex);
         if (primitive.vao != 0) glDeleteVertexArrays(1, &primitive.vao);
     }
     model.primitives.clear();
 }
 
+// Load sky atlas
 static GLuint loadSkyAtlasTexture2D(const std::string& path) {
-    int width = 0, height = 0, channels = 0;
-    stbi_set_flip_vertically_on_load(false);
-    unsigned char* data = stbi_load(path.c_str(), &width, &height, &channels, 0);
-    if (!data) return 0;
-
-    GLuint texId = 0;
-    glGenTextures(1, &texId);
-    glBindTexture(GL_TEXTURE_2D, texId);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    GLenum format = (channels == 4) ? GL_RGBA : (channels == 1 ? GL_RED : GL_RGB);
-    glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-    stbi_image_free(data);
-    return texId;
+    return loadTexture2DFromFile(path, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
 }
 
+// Run application
 int main() {
+    int exitCode = 0;
+    bool glfwReady = false;
+    bool glReady = false;
     SceneConfig config{};
-    if (!loadSceneConfig("input/scene.cfg", config)) {
-        return 1;
-    }
-    launchStreamV2Bridge(config);
-    SOCKET streamSocket = connectToStreamV2(config);
-    if (streamSocket == INVALID_SOCKET) {
-        return 1;
-    }
-    if (!glfwInit()) {
-        return 1;
-    }
-
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-    GLFWwindow* window = glfwCreateWindow(gWindowWidth, gWindowHeight, "OUT FPS: 0 | NEW FPS: 0", nullptr, nullptr);
-    if (!window) {
-        glfwTerminate();
-        return 1;
-    }
-    glfwSetWindowAspectRatio(window, 1, 1);
-    glfwMakeContextCurrent(window);
-    glfwSetInputMode(window, GLFW_STICKY_KEYS, GL_TRUE);
-    glfwSetKeyCallback(window, keyCallback);
-    glfwSetCursorPosCallback(window, cursorPositionCallback);
-    glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
-    if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
-
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
-
-    GLuint modelProgram = LoadShadersFromFile(kModelVertPath, kModelFragPath);
-    GLuint shadowProgram = LoadShadersFromFile(kShadowVertPath, kShadowFragPath);
-    GLuint skyProgram = LoadShadersFromFile(kSkyVertPath, kSkyFragPath);
-    const char* quadVs = "#version 330 core\nlayout(location=0) in vec2 aPos;\nlayout(location=1) in vec2 aUv;\nout vec2 vUv;\nvoid main(){vUv=aUv;gl_Position=vec4(aPos,0.0,1.0);}";
-    const char* quadFs = "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform sampler2D uTex;\nvoid main(){FragColor=texture(uTex,vec2(vUv.x,1.0-vUv.y));}";
-    GLuint quadProgram = CreateProgramFromSource(quadVs, quadFs);
-    if (modelProgram == 0 || shadowProgram == 0 || skyProgram == 0 || quadProgram == 0) {
-        if (shadowProgram != 0) glDeleteProgram(shadowProgram);
-        if (quadProgram != 0) glDeleteProgram(quadProgram);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
-
+    SOCKET streamSocket = INVALID_SOCKET;
+    GLFWwindow* window = nullptr;
+    GLuint modelProgram = 0;
+    GLuint shadowProgram = 0;
+    GLuint skyProgram = 0;
+    GLuint quadProgram = 0;
+    GLuint skyVAO = 0;
+    GLuint skyPosVBO = 0;
+    GLuint skyUvVBO = 0;
+    GLuint skyEBO = 0;
+    GLuint skyAtlasTex = 0;
+    GLuint quadVAO = 0;
+    GLuint quadVBO = 0;
+    GLuint quadEBO = 0;
+    GLuint stylizedTex = 0;
+    GLuint superresTex = 0;
     GltfModelGpu modelGpu;
-    if (!loadGltfModel(config.modelPath, modelGpu)) {
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
+    CaptureFramebuffer captureFramebuffer{};
+    ShadowFramebuffer shadowFramebuffer{};
+    StreamSharedState sharedState{};
+    std::thread streamSendThread;
+    std::thread streamReceiveThread;
 
-    gModelFitScale = 1.2f / glm::max(0.001f, modelGpu.radius);
-    gLookAt = glm::vec3(0.0f);
-    gDefaultViewDistance = 4.0f;
-    gViewDistance = gDefaultViewDistance;
-    updateCameraFromSpherical();
+    do {
+        if (!loadSceneConfig("input/scene.cfg", config)) {
+            exitCode = 2;
+            break;
+        }
+        launchStreamV2Bridge(config);
+        streamSocket = connectToStreamV2(config);
+        if (streamSocket == INVALID_SOCKET) {
+            exitCode = 2;
+            break;
+        }
+        if (!glfwInit()) {
+            exitCode = 2;
+            break;
+        }
+        glfwReady = true;
+
+        int panelCount = config.streamV2UseSuperres ? 3 : 2;
+        windowHeight = 512;
+        windowWidth = windowHeight * panelCount;
+
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+        window = glfwCreateWindow(windowWidth, windowHeight, "OUT FPS: 0 | NEW FPS: 0", nullptr, nullptr);
+        if (!window) {
+            exitCode = 2;
+            break;
+        }
+        glfwSetWindowAspectRatio(window, panelCount, 1);
+        glfwMakeContextCurrent(window);
+        glfwSetInputMode(window, GLFW_STICKY_KEYS, GL_TRUE);
+        glfwSetKeyCallback(window, key_callback);
+        glfwSetCursorPosCallback(window, cursor_callback);
+        glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+        if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
+            exitCode = 2;
+            break;
+        }
+        glReady = true;
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+
+        modelProgram = LoadShadersFromFile(kModelVertPath, kModelFragPath);
+        shadowProgram = LoadShadersFromFile(kShadowVertPath, kShadowFragPath);
+        skyProgram = LoadShadersFromFile(kSkyVertPath, kSkyFragPath);
+        const char* quadVs = "#version 330 core\nlayout(location=0) in vec2 aPos;\nlayout(location=1) in vec2 aUv;\nout vec2 vUv;\nvoid main(){vUv=aUv;gl_Position=vec4(aPos,0.0,1.0);}";
+        const char* quadFs = "#version 330 core\nin vec2 vUv;\nout vec4 FragColor;\nuniform sampler2D uTex;\nvoid main(){FragColor=texture(uTex,vec2(vUv.x,1.0-vUv.y));}";
+        quadProgram = CreateProgramFromSource(quadVs, quadFs);
+        if (modelProgram == 0 || shadowProgram == 0 || skyProgram == 0 || quadProgram == 0) {
+            exitCode = 2;
+            break;
+        }
+
+        if (!loadGltfModel(config.modelPath, config.texturePath, modelGpu)) {
+            exitCode = 2;
+            break;
+        }
+
+        modelFitScale = 1.2f / glm::max(0.001f, modelGpu.radius);
+        lookat = glm::vec3(0.0f);
+        defaultViewDistance = 4.0f;
+        viewDistance = defaultViewDistance;
+        updateCameraFromSpherical();
 
     float skyboxVertexData[] = {
         -1.0f, -1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f,  1.0f,  1.0f, -1.0f,  1.0f,  1.0f,
@@ -1051,7 +1348,6 @@ int main() {
         12, 13, 14, 12, 14, 15, 16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23
     };
 
-    GLuint skyVAO = 0, skyPosVBO = 0, skyUvVBO = 0, skyEBO = 0;
     glGenVertexArrays(1, &skyVAO);
     glGenBuffers(1, &skyPosVBO);
     glGenBuffers(1, &skyUvVBO);
@@ -1069,21 +1365,11 @@ int main() {
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(skyboxIndexData), skyboxIndexData, GL_STATIC_DRAW);
     glBindVertexArray(0);
 
-    GLuint skyAtlasTex = loadSkyAtlasTexture2D(config.skyboxAtlasPath);
-    if (skyAtlasTex == 0) {
-        cleanupGltfModel(modelGpu);
-        glDeleteVertexArrays(1, &skyVAO);
-        glDeleteBuffers(1, &skyPosVBO);
-        glDeleteBuffers(1, &skyUvVBO);
-        glDeleteBuffers(1, &skyEBO);
-        glDeleteProgram(modelProgram);
-        glDeleteProgram(shadowProgram);
-        glDeleteProgram(skyProgram);
-        glDeleteProgram(quadProgram);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
+        skyAtlasTex = loadSkyAtlasTexture2D(config.skyboxAtlasPath);
+        if (skyAtlasTex == 0) {
+            exitCode = 2;
+            break;
+        }
 
     float quadVertices[] = {
         -1.0f, -1.0f, 0.0f, 0.0f,
@@ -1092,7 +1378,6 @@ int main() {
         -1.0f,  1.0f, 0.0f, 1.0f
     };
     unsigned int quadIndices[] = {0, 1, 2, 0, 2, 3};
-    GLuint quadVAO = 0, quadVBO = 0, quadEBO = 0, stylizedTex = 0;
     glGenVertexArrays(1, &quadVAO);
     glGenBuffers(1, &quadVBO);
     glGenBuffers(1, &quadEBO);
@@ -1107,60 +1392,30 @@ int main() {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * static_cast<GLsizei>(sizeof(float)), reinterpret_cast<void*>(2 * sizeof(float)));
     glBindVertexArray(0);
     glGenTextures(1, &stylizedTex);
+    glGenTextures(1, &superresTex);
     glUseProgram(quadProgram);
     glUniform1i(glGetUniformLocation(quadProgram, "uTex"), 0);
 
     glUseProgram(skyProgram);
     glUniform1i(glGetUniformLocation(skyProgram, "uSkyAtlas"), 0);
 
-    CaptureFramebuffer captureFramebuffer{};
-    ShadowFramebuffer shadowFramebuffer{};
-    if (!initCaptureFramebuffer(captureFramebuffer, config.streamCaptureSide)) {
-        cleanupGltfModel(modelGpu);
-        glDeleteVertexArrays(1, &skyVAO);
-        glDeleteBuffers(1, &skyPosVBO);
-        glDeleteBuffers(1, &skyUvVBO);
-        glDeleteBuffers(1, &skyEBO);
-        glDeleteVertexArrays(1, &quadVAO);
-        glDeleteBuffers(1, &quadVBO);
-        glDeleteBuffers(1, &quadEBO);
-        glDeleteTextures(1, &skyAtlasTex);
-        glDeleteTextures(1, &stylizedTex);
-        glDeleteProgram(modelProgram);
-        glDeleteProgram(skyProgram);
-        glDeleteProgram(quadProgram);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
-    if (!initShadowFramebuffer(shadowFramebuffer, 1024, 1024)) {
-        cleanupCaptureFramebuffer(captureFramebuffer);
-        cleanupGltfModel(modelGpu);
-        glDeleteVertexArrays(1, &skyVAO);
-        glDeleteBuffers(1, &skyPosVBO);
-        glDeleteBuffers(1, &skyUvVBO);
-        glDeleteBuffers(1, &skyEBO);
-        glDeleteVertexArrays(1, &quadVAO);
-        glDeleteBuffers(1, &quadVBO);
-        glDeleteBuffers(1, &quadEBO);
-        glDeleteTextures(1, &skyAtlasTex);
-        glDeleteTextures(1, &stylizedTex);
-        glDeleteProgram(modelProgram);
-        glDeleteProgram(shadowProgram);
-        glDeleteProgram(skyProgram);
-        glDeleteProgram(quadProgram);
-        glfwDestroyWindow(window);
-        glfwTerminate();
-        return 1;
-    }
+        if (!initCaptureFramebuffer(captureFramebuffer, config.streamCaptureSide)) {
+            exitCode = 2;
+            break;
+        }
+        if (!initShadowFramebuffer(shadowFramebuffer, 1024, 1024)) {
+            exitCode = 2;
+            break;
+        }
     auto lastCaptureTime = std::chrono::steady_clock::now();
     const float streamFps = (config.streamInputFps > 0.0f) ? config.streamInputFps : 10.0f;
     const std::chrono::duration<float> streamInterval(1.0f / streamFps);
-    StreamSharedState sharedState{};
     uint32_t nextCaptureSeq = 1;
-    std::thread streamSendThread(streamSendLoop, streamSocket, &sharedState);
-    std::thread streamReceiveThread(streamReceiveLoop, streamSocket, &sharedState);
+    streamSendThread = std::thread(streamSendLoop, streamSocket, &sharedState);
+    streamReceiveThread = std::thread(streamReceiveLoop, streamSocket, &sharedState);
     bool hasStylizedFrame = false;
+    bool hasSuperresFrame = false;
+    int activePanelCount = panelCount;
     int displayedOutputFps = 0;
     int displayedNewOutputFps = 0;
     uint64_t lastReadyCount = 0;
@@ -1169,13 +1424,13 @@ int main() {
     while (!glfwWindowShouldClose(window)) {
         int w = 1, h = 1;
         glfwGetFramebufferSize(window, &w, &h);
-        glm::mat4 view = glm::lookAt(gCameraPos, gLookAt, gUp);
+        glm::mat4 view = glm::lookAt(eye_center, lookat, up);
         glm::mat4 rotateModel = glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
         rotateModel = glm::rotate(rotateModel, glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
         glm::mat4 modelMatrix = rotateModel *
-            glm::scale(glm::mat4(1.0f), glm::vec3(gModelFitScale)) *
+            glm::scale(glm::mat4(1.0f), glm::vec3(modelFitScale)) *
             glm::translate(glm::mat4(1.0f), -modelGpu.center);
-        const glm::mat4 lightSpaceMatrix = computeLightSpaceMatrix(modelGpu, modelMatrix, gLightPosition);
+        const glm::mat4 lightSpaceMatrix = computeLightSpaceMatrix(modelGpu, modelMatrix, lightPosition);
         bool shadowRenderedThisFrame = false;
 
         auto nowCapture = std::chrono::steady_clock::now();
@@ -1201,25 +1456,25 @@ int main() {
                 modelMatrix,
                 view,
                 lightSpaceMatrix,
-                gLightPosition,
-                gLightIntensity,
+                lightPosition,
+                lightIntensity,
+                0,
+                0,
                 captureFramebuffer.side,
-                captureFramebuffer.side
+                captureFramebuffer.side,
+                true
             );
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             if (captureFrameFromFramebuffer(captureFramebuffer, captured, captureSide)) {
                 std::lock_guard<std::mutex> lock(sharedState.mutex);
-                ++sharedState.capturedCount;
-                if (sharedState.pendingInputs.size() < kMaxPendingStreamInputs) {
-                    StreamPendingInput pending{};
-                    pending.rgb = std::move(captured);
-                    pending.side = captureSide;
-                    pending.seq = nextCaptureSeq++;
-                    sharedState.pendingInputs.push_back(std::move(pending));
-                    ++sharedState.enqueuedCount;
-                } else {
-                    ++sharedState.droppedCount;
+                StreamPendingInput pending{};
+                pending.rgb = std::move(captured);
+                pending.side = captureSide;
+                pending.seq = nextCaptureSeq++;
+                if (sharedState.pendingInputs.size() >= kMaxPendingStreamInputs) {
+                    sharedState.pendingInputs.pop_front();
                 }
+                sharedState.pendingInputs.push_back(std::move(pending));
             }
             }
             lastCaptureTime = nowCapture;
@@ -1227,50 +1482,70 @@ int main() {
         {
             std::lock_guard<std::mutex> lock(sharedState.mutex);
             if (sharedState.hasNewOutput) {
-                updateStylizedTextureFromMemory(sharedState.latestOutput, sharedState.outputWidth, sharedState.outputHeight, stylizedTex);
+                updateStylizedTextureFromMemory(sharedState.latestStylizedOutput, sharedState.stylizedWidth, sharedState.stylizedHeight, stylizedTex);
+                if (!sharedState.latestSuperresOutput.empty()) {
+                    updateStylizedTextureFromMemory(sharedState.latestSuperresOutput, sharedState.superresWidth, sharedState.superresHeight, superresTex);
+                    hasSuperresFrame = true;
+                }
                 sharedState.hasNewOutput = false;
                 hasStylizedFrame = true;
             }
         }
-        const bool showStylizedFrame = gShowStylized && hasStylizedFrame;
-        if (!showStylizedFrame) {
-            if (!shadowRenderedThisFrame) {
-                renderShadowMap(modelGpu, shadowProgram, shadowFramebuffer, modelMatrix, lightSpaceMatrix);
+        const int desiredPanelCount = (config.streamV2UseSuperres || hasSuperresFrame) ? 3 : 2;
+        if (desiredPanelCount != activePanelCount) {
+            activePanelCount = desiredPanelCount;
+            glfwSetWindowAspectRatio(window, activePanelCount, 1);
+            glfwSetWindowSize(window, windowHeight * activePanelCount, windowHeight);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, w, h);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        if (!shadowRenderedThisFrame) {
+            renderShadowMap(modelGpu, shadowProgram, shadowFramebuffer, modelMatrix, lightSpaceMatrix);
+        }
+
+        const int panelSide = std::max(1, std::min(h, w / activePanelCount));
+        const int totalPanelsWidth = panelSide * activePanelCount;
+        const int panelOffsetX = (w - totalPanelsWidth) / 2;
+        const int panelY = (h - panelSide) / 2;
+        const auto panelX = [&](int index) { return panelOffsetX + index * panelSide; };
+
+        const int originalX = panelX(0);
+        originalPanelX = originalX;
+        originalPanelY = panelY;
+        originalPanelWidth = panelSide;
+        originalPanelHeight = panelSide;
+        renderSceneToCurrentFramebuffer(
+            modelGpu,
+            modelProgram,
+            skyProgram,
+            skyVAO,
+            skyAtlasTex,
+            shadowFramebuffer.depthTex,
+            modelMatrix,
+            view,
+            lightSpaceMatrix,
+            lightPosition,
+            lightIntensity,
+            originalX,
+            panelY,
+            panelSide,
+            panelSide,
+            false
+        );
+
+        const int stylizedX = panelX(1);
+        if (hasStylizedFrame) {
+            drawTexturePanel(quadProgram, quadVAO, stylizedTex, stylizedX, panelY, panelSide, panelSide);
+        }
+
+        if (activePanelCount == 3) {
+            const int superresX = panelX(2);
+            if (hasSuperresFrame) {
+                drawTexturePanel(quadProgram, quadVAO, superresTex, superresX, panelY, panelSide, panelSide);
             }
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            renderSceneToCurrentFramebuffer(
-                modelGpu,
-                modelProgram,
-                skyProgram,
-                skyVAO,
-                skyAtlasTex,
-                shadowFramebuffer.depthTex,
-                modelMatrix,
-                view,
-                lightSpaceMatrix,
-                gLightPosition,
-                gLightIntensity,
-                w,
-                h
-            );
-        } else {
-            glDisable(GL_DEPTH_TEST);
-            glDisable(GL_CULL_FACE);
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            const int displaySide = std::min(w, h);
-            const int viewportX = (w - displaySide) / 2;
-            const int viewportY = (h - displaySide) / 2;
-            glViewport(viewportX, viewportY, displaySide, displaySide);
-            glUseProgram(quadProgram);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, stylizedTex);
-            glBindVertexArray(quadVAO);
-            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, reinterpret_cast<void*>(0));
-            glBindVertexArray(0);
-            glViewport(0, 0, w, h);
-            glEnable(GL_DEPTH_TEST);
-            glEnable(GL_CULL_FACE);
         }
 
         const auto nowFps = std::chrono::steady_clock::now();
@@ -1297,33 +1572,40 @@ int main() {
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
-    {
+    } while (false);
+
+    if (streamSendThread.joinable() || streamReceiveThread.joinable()) {
         std::lock_guard<std::mutex> lock(sharedState.mutex);
         sharedState.stop = true;
     }
-    shutdown(streamSocket, SD_BOTH);
+    if (streamSocket != INVALID_SOCKET) shutdown(streamSocket, SD_BOTH);
     if (streamSendThread.joinable()) streamSendThread.join();
     if (streamReceiveThread.joinable()) streamReceiveThread.join();
-    closesocket(streamSocket);
-    WSACleanup();
+    if (streamSocket != INVALID_SOCKET) {
+        closesocket(streamSocket);
+        WSACleanup();
+    }
 
-    cleanupGltfModel(modelGpu);
-    cleanupCaptureFramebuffer(captureFramebuffer);
-    cleanupShadowFramebuffer(shadowFramebuffer);
-    glDeleteVertexArrays(1, &skyVAO);
-    glDeleteBuffers(1, &skyPosVBO);
-    glDeleteBuffers(1, &skyUvVBO);
-    glDeleteBuffers(1, &skyEBO);
-    glDeleteVertexArrays(1, &quadVAO);
-    glDeleteBuffers(1, &quadVBO);
-    glDeleteBuffers(1, &quadEBO);
-    glDeleteTextures(1, &skyAtlasTex);
-    glDeleteTextures(1, &stylizedTex);
-    glDeleteProgram(modelProgram);
-    glDeleteProgram(shadowProgram);
-    glDeleteProgram(skyProgram);
-    glDeleteProgram(quadProgram);
-    glfwDestroyWindow(window);
-    glfwTerminate();
-    return 0;
+    if (glReady) {
+        cleanupGltfModel(modelGpu);
+        cleanupCaptureFramebuffer(captureFramebuffer);
+        cleanupShadowFramebuffer(shadowFramebuffer);
+        if (skyVAO != 0) glDeleteVertexArrays(1, &skyVAO);
+        if (skyPosVBO != 0) glDeleteBuffers(1, &skyPosVBO);
+        if (skyUvVBO != 0) glDeleteBuffers(1, &skyUvVBO);
+        if (skyEBO != 0) glDeleteBuffers(1, &skyEBO);
+        if (quadVAO != 0) glDeleteVertexArrays(1, &quadVAO);
+        if (quadVBO != 0) glDeleteBuffers(1, &quadVBO);
+        if (quadEBO != 0) glDeleteBuffers(1, &quadEBO);
+        if (skyAtlasTex != 0) glDeleteTextures(1, &skyAtlasTex);
+        if (stylizedTex != 0) glDeleteTextures(1, &stylizedTex);
+        if (superresTex != 0) glDeleteTextures(1, &superresTex);
+        if (modelProgram != 0) glDeleteProgram(modelProgram);
+        if (shadowProgram != 0) glDeleteProgram(shadowProgram);
+        if (skyProgram != 0) glDeleteProgram(skyProgram);
+        if (quadProgram != 0) glDeleteProgram(quadProgram);
+    }
+    if (window != nullptr) glfwDestroyWindow(window);
+    if (glfwReady) glfwTerminate();
+    return exitCode;
 }

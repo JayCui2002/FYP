@@ -77,7 +77,7 @@ class SingleGPUInferencePipeline:
         self.base_chunk_size = 1
         self.t_refresh = 50
         self.profile = bool(config.get("profile", False))
-        self.refresh_history_frames = 4
+        self.refresh_history_frames = 1 + 4 * self.pipeline.num_frame_per_block
         
         self.logger.info("Single GPU inference pipeline manager initialized")
     
@@ -154,7 +154,7 @@ class SingleGPUInferencePipeline:
             current_end=current_end,
             batch_denoise=False,
         )
-        initial_video = self._decode_video_array(denoised_pred, last_frame_only=False)
+        initial_video = self._decode_video_array(denoised_pred, last_frame_only=True)
 
         session = SingleGPUStreamSession(
             prompt=prompt,

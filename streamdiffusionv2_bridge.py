@@ -1,5 +1,6 @@
 import argparse
 import importlib
+import io
 import os
 import select
 import socket
@@ -14,23 +15,55 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 REQUEST_HEADER = struct.Struct("<4sIIII")
-RESPONSE_HEADER = struct.Struct("<4sIIIII")
+RESPONSE_HEADER = struct.Struct("<4sIIIIIIII")
 REQUEST_MAGIC = b"FRM0"
 RESPONSE_MAGIC = b"OUT0"
 RESPONSE_FLAG_STYLIZED_READY = 1
 RESPONSE_FLAG_REUSE_LATEST = 2
 DEFAULT_SR_MODEL = "realesrgan-x2plus"
 DEFAULT_SR_X2_URL = "https://huggingface.co/2kpr/Real-ESRGAN/resolve/main/RealESRGAN_x2plus.pth"
+DEFAULT_METRICS_OUTPUT = "stream_metrics.txt"
 
-
-def log(message: str):
-    return
-
-
+# Print ready line
 def log_ready(seq: int, reuse_latest: bool):
     print(f"[bridge] ready seq={seq} reuse={1 if reuse_latest else 0}", flush=True)
 
 
+# Save stream stats
+def write_metrics(engine):
+    if not isinstance(engine, dict):
+        return
+    path = Path(__file__).resolve().parent / DEFAULT_METRICS_OUTPUT
+    first_output_time = engine.get("first_output_time")
+    last_output_time = engine.get("last_output_time")
+    metrics_output_count = int(engine.get("metrics_output_count", 0))
+    if (
+        first_output_time is not None
+        and last_output_time is not None
+        and last_output_time > first_output_time
+        and metrics_output_count > 1
+    ):
+        average_fps = (metrics_output_count - 1) / (last_output_time - first_output_time)
+    else:
+        average_fps = 0.0
+    latency_count = int(engine.get("latency_count", 0))
+    if latency_count > 0:
+        average_latency_ms = float(engine.get("latency_sum_ms", 0.0)) / latency_count
+    else:
+        average_latency_ms = 0.0
+    text = (
+        f"average_output_fps={average_fps:.4f}\n"
+        f"average_latency_ms={average_latency_ms:.4f}\n"
+        f"output_frames={metrics_output_count}\n"
+        f"latency_samples={latency_count}\n"
+    )
+    try:
+        path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+# Extend module path
 def setup_local_streamdiffusionv2_path():
     repo_root = Path(__file__).resolve().parent
     local_pkg_root = repo_root / "third_party" / "streamdiffusionv2"
@@ -41,6 +74,7 @@ def setup_local_streamdiffusionv2_path():
         sys.path.insert(0, local_pkg_root_str)
 
 
+# Patch sr imports
 def ensure_superres_compat():
     if "torchvision.transforms.functional_tensor" not in sys.modules:
         try:
@@ -50,6 +84,7 @@ def ensure_superres_compat():
             pass
 
 
+# Resolve sr path
 def resolve_superres_model_path(args):
     if args.sr_model_path:
         return args.sr_model_path.strip()
@@ -61,20 +96,19 @@ def resolve_superres_model_path(args):
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "RealESRGAN_x2plus.pth"
     if not model_path.exists():
-        log(f"Downloading 2x super resolution weights to: {model_path}")
         urllib.request.urlretrieve(DEFAULT_SR_X2_URL, model_path)
     return str(model_path)
 
 
+# Build sr backend
 def build_superres(args, torch_module, runtime_device):
     if not args.sr:
         return None
     if int(args.sr_scale) != 2:
-        raise RuntimeError(f"only 2x super resolution is supported right now, got: {args.sr_scale}")
+        raise RuntimeError()
     if args.sr_model != DEFAULT_SR_MODEL:
-        raise RuntimeError(f"unsupported super resolution model: {args.sr_model}")
+        raise RuntimeError()
 
-    log("Loading 2x super resolution backend.")
     ensure_superres_compat()
     RRDBNet = importlib.import_module("basicsr.archs.rrdbnet_arch").RRDBNet
     RealESRGANer = importlib.import_module("realesrgan").RealESRGANer
@@ -91,7 +125,6 @@ def build_superres(args, torch_module, runtime_device):
         half=(runtime_device.type == "cuda"),
         device=runtime_device,
     )
-    log("2x super resolution backend is ready.")
     return {
         "backend": DEFAULT_SR_MODEL,
         "upsampler": upsampler,
@@ -101,6 +134,7 @@ def build_superres(args, torch_module, runtime_device):
     }
 
 
+# Apply sr frame
 def maybe_apply_superres_rgb_array(engine, rgb_array):
     if rgb_array is None:
         return None
@@ -118,6 +152,7 @@ def maybe_apply_superres_rgb_array(engine, rgb_array):
     return output_rgb
 
 
+# Build inference engine
 def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, args):
     del model_id
     del negative_prompt
@@ -127,13 +162,13 @@ def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, 
     if args.real_v2:
         config_path = Path(args.config_path)
         if not config_path.exists():
-            raise RuntimeError(f"real-v2 config not found: {config_path}")
+            raise RuntimeError()
         checkpoint_model = Path(args.checkpoint_folder) / "model.pt"
         if not checkpoint_model.exists():
-            raise RuntimeError(f"real-v2 checkpoint not found: {checkpoint_model}")
+            raise RuntimeError()
         torch = importlib.import_module("torch")
         merge_cli_config = importlib.import_module("streamv2v.inference_common").merge_cli_config
-        inference_module_name = "streamv2v.inference"
+        inference_module_name = "streamv2v.inference_wo_batch" if args.stream_wo_batch else "streamv2v.inference"
         inference_module = importlib.import_module(inference_module_name)
         SingleGPUInferencePipeline = inference_module.SingleGPUInferencePipeline
         set_seed = importlib.import_module("models.util").set_seed
@@ -152,7 +187,6 @@ def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, 
             use_taehv=args.use_taehv,
         )
         if not args.input and getattr(args, "use_taehv", False):
-            log("Ignoring --use-taehv for socket realtime mode and using Wan VAE decode.")
             args.use_taehv = False
             config_overlay.use_taehv = False
         config = merge_cli_config(str(config_path), config_overlay)
@@ -164,9 +198,8 @@ def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, 
         manager = SingleGPUInferencePipeline(config, runtime_device)
         manager.load_model(str(Path(args.checkpoint_folder)))
         superres = build_superres(args, torch, runtime_device)
-        if args.stream_wo_batch:
-            log("Ignoring --stream-wo-batch for socket realtime mode and using inference_stream.")
-        chunk_size = manager.base_chunk_size * manager.pipeline.num_frame_per_block
+        base_chunk_size = manager.base_chunk_size * manager.pipeline.num_frame_per_block
+        chunk_size = 4 * manager.pipeline.num_frame_per_block if args.stream_wo_batch else base_chunk_size
         priming_frames = 1 + chunk_size
         return {
             "backend": "streamv2v_real",
@@ -178,29 +211,27 @@ def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, 
             "noise_scale": float(args.noise_scale),
             "init_noise_scale": float(args.noise_scale),
             "base_chunk_size": int(manager.base_chunk_size),
+            "stream_wo_batch": bool(args.stream_wo_batch),
             "chunk_size": int(chunk_size),
             "priming_frames": int(priming_frames),
             "frame_buffer": [],
             "initialized": False,
-            "current_start": 0,
-            "current_end": 0,
-            "last_input_tensor": None,
+            "session": None,
             "last_output": None,
             "num_steps": int(len(manager.pipeline.denoising_step_list)),
             "height": int(args.height),
             "width": int(args.width),
             "t_refresh": int(getattr(manager, "t_refresh", 50)),
             "superres": superres,
-            "received_requests": 0,
-            "sent_responses": 0,
-            "sent_ready_responses": 0,
-            "sent_reuse_responses": 0,
-            "sent_intermediate_responses": 0,
-            "produced_outputs": 0,
-            "pending_boundary_requests": 0,
-            "debug_log_interval": 16,
-            "cached_ready_frame": None,
-            "cached_ready_size": None,
+            "cached_stylized_frame": None,
+            "cached_stylized_size": None,
+            "cached_superres_frame": None,
+            "cached_superres_size": None,
+            "first_output_time": None,
+            "last_output_time": None,
+            "latency_sum_ms": 0.0,
+            "latency_count": 0,
+            "metrics_output_count": 0,
         }
 
     inference_module_name = "streamv2v.inference"
@@ -213,24 +244,38 @@ def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, 
     return fallback_engine
 
 
-def _frames_to_tensor(frame_list, torch, device):
-    arr = np.stack(frame_list, axis=0).astype(np.float32)
-    arr = arr / 127.5 - 1.0
-    tensor = torch.from_numpy(arr).permute(3, 0, 1, 2).unsqueeze(0).contiguous()
-    return tensor.to(device=device, dtype=torch.bfloat16)
+# Pack input batch
+def make_input_batch(frames, torch, device, target_height=None, target_width=None):
+    arr = np.stack(frames, axis=0)
+    tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
+    tensor = tensor.to(device=device, dtype=torch.float32)
+    if (
+        target_height is not None
+        and target_width is not None
+        and (tensor.shape[2] != target_height or tensor.shape[3] != target_width)
+    ):
+        tensor = torch.nn.functional.interpolate(
+            tensor,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+    tensor = tensor / 127.5 - 1.0
+    return tensor.permute(1, 0, 2, 3).unsqueeze(0).contiguous().to(dtype=torch.bfloat16)
 
 
-def _decode_last_frame_to_image(video_np):
+# Decode last frame
+def decode_last_image(video_np):
     if video_np is None:
         return None
     if video_np.ndim != 4 or video_np.shape[-1] != 3:
         return None
     frame = video_np[-1]
-    frame_u8 = np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(frame_u8, mode="RGB")
+    return np.clip(frame * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
-def output_to_rgb_array(output):
+# Normalize output frame
+def to_rgb_frame(output):
     if isinstance(output, Image.Image):
         return np.array(output.convert("RGB"), dtype=np.uint8)
     if isinstance(output, np.ndarray):
@@ -243,10 +288,11 @@ def output_to_rgb_array(output):
             arr = arr[:, :, :3]
         return arr
     if isinstance(output, (list, tuple)) and output:
-        return output_to_rgb_array(output[0])
+        return to_rgb_frame(output[0])
     return None
 
 
+# Read exact bytes
 def recv_exact(sock, size: int):
     chunks = bytearray()
     while len(chunks) < size:
@@ -257,43 +303,47 @@ def recv_exact(sock, size: int):
     return bytes(chunks)
 
 
+# Decode request frame
 def _read_request(conn):
     header = recv_exact(conn, REQUEST_HEADER.size)
     if header is None:
         return None
     magic, width, height, payload_size, seq = REQUEST_HEADER.unpack(header)
     if magic != REQUEST_MAGIC:
-        raise ConnectionError("invalid request header")
+        raise ConnectionError()
     payload = recv_exact(conn, payload_size)
     if payload is None:
         return None
-    frame = np.frombuffer(payload, dtype=np.uint8)
-    if frame.size != width * height * 3:
-        raise ConnectionError("invalid frame payload size")
-    image = Image.fromarray(frame.reshape((height, width, 3)), mode="RGB")
+    if payload_size == width * height * 3:
+        frame = np.frombuffer(payload, dtype=np.uint8)
+        rgb = frame.reshape((height, width, 3)).copy()
+    else:
+        try:
+            with Image.open(io.BytesIO(payload)) as image:
+                image = image.convert("RGB")
+                if image.size != (width, height):
+                    image = image.resize((width, height), Image.BILINEAR)
+                rgb = np.array(image, dtype=np.uint8)
+        except Exception as exc:
+            raise ConnectionError() from exc
     return {
         "seq": seq,
-        "image": image,
-        "rgb": np.array(image, dtype=np.uint8),
+        "rgb": rgb,
         "width": width,
         "height": height,
+        "received_time": time.perf_counter(),
     }
 
 
-def _max_batch_requests(engine):
-    if not engine["initialized"]:
-        return int(engine["priming_frames"])
-    return int(engine["chunk_size"])
-
-
-def _drain_request_batch(conn, max_requests):
+# Drain request batch
+def _drain_request_batch(conn, limit):
     requests = []
     first = _read_request(conn)
     if first is None:
         return requests
     requests.append(first)
 
-    while len(requests) < max_requests:
+    while len(requests) < limit:
         ready, _, _ = select.select([conn], [], [], 0.0)
         if not ready:
             break
@@ -305,121 +355,179 @@ def _drain_request_batch(conn, max_requests):
     return requests
 
 
-def _consume_frame_batch(engine, count):
-    batch = engine["frame_buffer"][:count]
-    del engine["frame_buffer"][:count]
-    return batch
-
-
-def _initialize_stream_engine(engine, prompt):
+# Prime stream session
+def start_real_stream(engine, prompt):
     manager = engine["manager"]
-    inp = _frames_to_tensor(_consume_frame_batch(engine, engine["priming_frames"]), engine["torch"], engine["device"])
-    manager.pipeline.vae.model.first_encode = True
-    manager.pipeline.vae.model.first_decode = True
-    manager.pipeline.kv_cache1 = None
-    manager.pipeline.crossattn_cache = None
-    manager.pipeline.block_x = None
-    manager.pipeline.hidden_states = None
-    manager.processed = 0
-    current_start = 0
-    current_end = manager.pipeline.frame_seq_length * (1 + engine["chunk_size"] // engine["base_chunk_size"])
-    noisy_latents = manager._encode_noisy_latents(inp, float(engine["noise_scale"]))
+    frames = engine["frame_buffer"][:engine["priming_frames"]]
+    del engine["frame_buffer"][:engine["priming_frames"]]
+    inp = make_input_batch(frames, engine["torch"], engine["device"], engine["height"], engine["width"])
     with engine["torch"].inference_mode():
-        denoised_pred = manager.prepare_pipeline(
-            text_prompts=[prompt or engine["prompt"]],
-            noise=noisy_latents,
-            current_start=current_start,
-            current_end=current_end,
+        session, initial_video = manager.start_stream_session(
+            prompt or engine["prompt"],
+            inp,
+            float(engine["noise_scale"]),
         )
-        video_np = manager._decode_video_array(denoised_pred, last_frame_only=False)
-    out_img = _decode_last_frame_to_image(video_np)
+    out_img = decode_last_image(initial_video)
     engine["initialized"] = True
-    engine["current_start"] = current_end
-    engine["current_end"] = current_end + (engine["chunk_size"] // engine["base_chunk_size"]) * manager.pipeline.frame_seq_length
-    engine["last_input_tensor"] = inp[:, :, [-1]].clone()
+    engine["session"] = session
+    engine["noise_scale"] = float(session.noise_scale)
     if out_img is not None:
         engine["last_output"] = out_img
-    engine["produced_outputs"] += 1
     return out_img
 
 
-def _step_stream_engine(engine):
+# Advance stream step
+def step_real_stream(engine):
     manager = engine["manager"]
-    inp = _frames_to_tensor(_consume_frame_batch(engine, engine["chunk_size"]), engine["torch"], engine["device"])
+    frames = engine["frame_buffer"][:engine["chunk_size"]]
+    del engine["frame_buffer"][:engine["chunk_size"]]
+    inp = make_input_batch(frames, engine["torch"], engine["device"], engine["height"], engine["width"])
+    session = engine.get("session")
+    if session is None:
+        return None
     noise_scale, current_step = engine["compute_noise_scale_and_step"](
-        engine["torch"].cat([engine["last_input_tensor"], inp], dim=2),
+        engine["torch"].cat([session.last_image, inp], dim=2),
         engine["chunk_size"] + 1,
         engine["chunk_size"],
-        float(engine["noise_scale"]),
-        float(engine["init_noise_scale"]),
+        float(session.noise_scale),
+        float(session.init_noise_scale),
     )
-    if engine["current_start"] // manager.pipeline.frame_seq_length >= engine["t_refresh"]:
-        engine["current_start"] = manager.pipeline.kv_cache_length - manager.pipeline.frame_seq_length
-        engine["current_end"] = engine["current_start"] + (engine["chunk_size"] // engine["base_chunk_size"]) * manager.pipeline.frame_seq_length
-    noisy_latents = manager._encode_noisy_latents(inp, noise_scale)
-    with engine["torch"].inference_mode():
-        denoised_pred = manager.pipeline.inference_stream(
-            noise=noisy_latents[:, -1].unsqueeze(1),
-            current_start=engine["current_start"],
-            current_end=engine["current_end"],
-            current_step=current_step,
-        )
-    manager.processed += 1
     out_img = None
-    if manager.processed >= engine["num_steps"]:
-        video_np = manager._decode_video_array(denoised_pred, last_frame_only=True)
-        out_img = _decode_last_frame_to_image(video_np)
-    engine["current_start"] = engine["current_end"]
-    engine["current_end"] += (engine["chunk_size"] // engine["base_chunk_size"]) * manager.pipeline.frame_seq_length
-    engine["last_input_tensor"] = inp[:, :, [-1]].clone()
-    engine["noise_scale"] = noise_scale
+    if engine.get("stream_wo_batch"):
+        if session.current_start // manager.pipeline.frame_seq_length >= engine["t_refresh"]:
+            with engine["torch"].inference_mode():
+                refreshed_session, refresh_video = manager._refresh_stream_session(session, inp)
+            session = refreshed_session
+            out_img = decode_last_image(refresh_video[[-1]] if refresh_video is not None else None)
+        else:
+            noisy_latents = manager._encode_noisy_latents(inp, noise_scale)
+            with engine["torch"].inference_mode():
+                denoised_pred = manager.pipeline.inference_wo_batch(
+                    noise=noisy_latents,
+                    current_start=session.current_start,
+                    current_end=session.current_end,
+                    current_step=current_step,
+                )
+            session.processed += 1
+            manager.processed = session.processed
+            video_np = manager._decode_video_array(denoised_pred, last_frame_only=True)
+            out_img = decode_last_image(video_np)
+            session.current_start = session.current_end
+            session.current_end += (engine["chunk_size"] // 4) * manager.pipeline.frame_seq_length
+            history_window = max(getattr(manager, "refresh_history_frames", 0), session.chunk_size + 1)
+            history_images = getattr(session, "history_images", None)
+            if history_images is None:
+                history_images = session.last_image
+            session.history_images = engine["torch"].cat([history_images, inp], dim=2)
+            if session.history_images.shape[2] > history_window:
+                session.history_images = session.history_images[:, :, -history_window:]
+            session.last_image = inp[:, :, [-1]].clone()
+            session.noise_scale = noise_scale
+    elif session.current_start // manager.pipeline.frame_seq_length >= engine["t_refresh"]:
+        refresh_images = engine["torch"].cat([session.last_image, inp], dim=2)
+        with engine["torch"].inference_mode():
+            refreshed_session, refresh_video = manager.start_stream_session(
+                session.prompt,
+                refresh_images,
+                float(session.noise_scale),
+            )
+        refreshed_session.processed = len(manager.pipeline.denoising_step_list)
+        manager.processed = refreshed_session.processed
+        session = refreshed_session
+        out_img = decode_last_image(refresh_video[[-1]] if refresh_video is not None else None)
+    else:
+        noisy_latents = manager._encode_noisy_latents(inp, noise_scale)
+        with engine["torch"].inference_mode():
+            denoised_pred = manager.pipeline.inference_stream(
+                noise=noisy_latents[:, -1].unsqueeze(1),
+                current_start=session.current_start,
+                current_end=session.current_end,
+                current_step=current_step,
+            )
+        session.processed += 1
+        manager.processed = session.processed
+        if session.processed >= engine["num_steps"]:
+            video_np = manager._decode_video_array(denoised_pred, last_frame_only=True)
+            out_img = decode_last_image(video_np)
+        session.current_start = session.current_end
+        session.current_end += (session.chunk_size // manager.base_chunk_size) * manager.pipeline.frame_seq_length
+        session.last_image = inp[:, :, [-1]].clone()
+        session.noise_scale = noise_scale
+    engine["session"] = session
+    engine["noise_scale"] = float(session.noise_scale)
     if out_img is not None:
         engine["last_output"] = out_img
-        engine["produced_outputs"] += 1
     return out_img
 
 
+# Collect ready frames
 def _process_ready_outputs(engine, prompt):
     outputs = []
     if not engine["initialized"] and len(engine["frame_buffer"]) >= engine["priming_frames"]:
-        outputs.append(_initialize_stream_engine(engine, prompt))
+        outputs.append(start_real_stream(engine, prompt))
     while engine["initialized"] and len(engine["frame_buffer"]) >= engine["chunk_size"]:
-        outputs.append(_step_stream_engine(engine))
+        outputs.append(step_real_stream(engine))
     return outputs
 
 
-def _cache_ready_frame(engine, output):
-    out_frame = output_to_rgb_array(output)
-    if out_frame is None:
-        return None
-    out_frame = maybe_apply_superres_rgb_array(engine, out_frame)
-    out_frame = np.ascontiguousarray(out_frame[:, :, :3])
-    engine["cached_ready_frame"] = out_frame
-    engine["cached_ready_size"] = (out_frame.shape[1], out_frame.shape[0])
-    return out_frame
+# Cache output frames
+def _cache_ready_frames(engine, output):
+    stylized_frame = to_rgb_frame(output)
+    if stylized_frame is None:
+        return None, None
+    stylized_frame = np.ascontiguousarray(stylized_frame[:, :, :3])
+    engine["cached_stylized_frame"] = stylized_frame
+    engine["cached_stylized_size"] = (stylized_frame.shape[1], stylized_frame.shape[0])
+
+    superres_frame = None
+    superres = engine.get("superres")
+    if superres and superres.get("enabled"):
+        superres_frame = maybe_apply_superres_rgb_array(engine, stylized_frame)
+        if superres_frame is not None:
+            superres_frame = np.ascontiguousarray(superres_frame[:, :, :3])
+            engine["cached_superres_frame"] = superres_frame
+            engine["cached_superres_size"] = (superres_frame.shape[1], superres_frame.shape[0])
+    else:
+        engine["cached_superres_frame"] = None
+        engine["cached_superres_size"] = None
+
+    return stylized_frame, superres_frame
 
 
+# Check refresh boundary
 def _refresh_pending(engine):
     if not engine.get("initialized"):
         return False
+    session = engine.get("session")
+    if session is None:
+        return False
     frame_seq_length = int(engine["manager"].pipeline.frame_seq_length)
-    return int(engine["current_start"]) // frame_seq_length >= int(engine["t_refresh"])
+    return int(session.current_start) // frame_seq_length >= int(engine["t_refresh"])
 
 
+# Send output packet
 def _send_response(conn, engine, request, output=None, stylized_ready=False, reuse_latest=False):
-    response = b""
-    out_w, out_h = request["width"], request["height"]
+    stylized_response = b""
+    superres_response = b""
+    stylized_w, stylized_h = request["width"], request["height"]
+    superres_w, superres_h = 0, 0
     if stylized_ready and not reuse_latest and output is not None:
-        out_frame = _cache_ready_frame(engine, output)
-        if out_frame is None:
+        stylized_frame, superres_frame = _cache_ready_frames(engine, output)
+        if stylized_frame is None:
             stylized_ready = False
         else:
-            out_h, out_w = out_frame.shape[:2]
-            response = out_frame.tobytes()
+            stylized_h, stylized_w = stylized_frame.shape[:2]
+            stylized_response = stylized_frame.tobytes()
+            if superres_frame is not None:
+                superres_h, superres_w = superres_frame.shape[:2]
+                superres_response = superres_frame.tobytes()
     elif stylized_ready and reuse_latest:
-        cached_size = engine.get("cached_ready_size")
-        if cached_size is not None:
-            out_w, out_h = cached_size
+        cached_stylized_size = engine.get("cached_stylized_size")
+        cached_superres_size = engine.get("cached_superres_size")
+        if cached_stylized_size is not None:
+            stylized_w, stylized_h = cached_stylized_size
+            if cached_superres_size is not None:
+                superres_w, superres_h = cached_superres_size
         else:
             stylized_ready = False
             reuse_latest = False
@@ -428,105 +536,117 @@ def _send_response(conn, engine, request, output=None, stylized_ready=False, reu
         flags |= RESPONSE_FLAG_STYLIZED_READY
     if reuse_latest:
         flags |= RESPONSE_FLAG_REUSE_LATEST
-    conn.sendall(RESPONSE_HEADER.pack(RESPONSE_MAGIC, out_w, out_h, len(response), flags, request["seq"]))
-    if response:
-        conn.sendall(response)
-    engine["sent_responses"] += 1
+    conn.sendall(RESPONSE_HEADER.pack(
+        RESPONSE_MAGIC,
+        stylized_w,
+        stylized_h,
+        len(stylized_response),
+        superres_w,
+        superres_h,
+        len(superres_response),
+        flags,
+        request["seq"],
+    ))
+    if stylized_response:
+        conn.sendall(stylized_response)
+    if superres_response:
+        conn.sendall(superres_response)
     if stylized_ready:
-        engine["sent_ready_responses"] += 1
         log_ready(request["seq"], reuse_latest)
-    if reuse_latest:
-        engine["sent_reuse_responses"] += 1
 
 
+# Send reuse packet
 def _send_intermediate_response(conn, engine, request):
-    engine["sent_intermediate_responses"] += 1
     if _refresh_pending(engine):
         _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
         return
-    if engine.get("cached_ready_frame") is not None:
+    if engine.get("cached_stylized_frame") is not None:
         _send_response(conn, engine, request, stylized_ready=True, reuse_latest=True)
         return
     _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
 
 
+# Run socket loop
 def serve_socket(engine, args):
-    log(f"Starting socket server on {args.host}:{args.port}.")
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((args.host, args.port))
     server.listen(1)
-    log("Waiting for OpenGL client connection.")
-    conn, _ = server.accept()
-    conn.settimeout(10.0)
-    log("OpenGL client connected.")
-    boundary_requests = []
-    with conn:
-        while True:
-            try:
-                requests = _drain_request_batch(conn, _max_batch_requests(engine))
-                if not requests:
-                    break
-            except (OSError, ConnectionError):
-                break
-
-            engine["received_requests"] += len(requests)
-            classified_initialized = engine["initialized"]
-            fill = len(engine["frame_buffer"])
-            try:
-                for request in requests:
-                    resized = request["image"].convert("RGB").resize((engine["width"], engine["height"]), Image.Resampling.BILINEAR)
-                    engine["frame_buffer"].append(np.array(resized, dtype=np.uint8))
-
-                    if not classified_initialized:
-                        fill += 1
-                        if fill == engine["priming_frames"]:
-                            boundary_requests.append(request)
-                            engine["pending_boundary_requests"] = len(boundary_requests)
-                            classified_initialized = True
-                            fill = 0
-                        else:
-                            _send_intermediate_response(conn, engine, request)
-                    else:
-                        fill += 1
-                        if fill == engine["chunk_size"]:
-                            boundary_requests.append(request)
-                            engine["pending_boundary_requests"] = len(boundary_requests)
-                            fill = 0
-                        else:
-                            _send_intermediate_response(conn, engine, request)
-
-                outputs = _process_ready_outputs(engine, args.prompt)
-                for output in outputs:
-                    if not boundary_requests:
+    try:
+        conn, _ = server.accept()
+        conn.settimeout(10.0)
+        boundary_requests = []
+        with conn:
+            while True:
+                try:
+                    limit = int(engine["priming_frames"] if not engine["initialized"] else engine["chunk_size"])
+                    requests = _drain_request_batch(conn, limit)
+                    if not requests:
                         break
-                    request = boundary_requests.pop(0)
-                    engine["pending_boundary_requests"] = len(boundary_requests)
-                    if output is not None:
-                        _send_response(conn, engine, request, output, stylized_ready=True, reuse_latest=False)
-                    else:
-                        _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
-            except (OSError, ConnectionError):
-                break
-    server.close()
+                except (OSError, ConnectionError):
+                    break
+
+                classified_initialized = engine["initialized"]
+                fill = len(engine["frame_buffer"])
+                try:
+                    for request in requests:
+                        engine["frame_buffer"].append(request["rgb"])
+
+                        if not classified_initialized:
+                            fill += 1
+                            if fill == engine["priming_frames"]:
+                                boundary_requests.append(request)
+                                classified_initialized = True
+                                fill = 0
+                            else:
+                                _send_intermediate_response(conn, engine, request)
+                        else:
+                            fill += 1
+                            if fill == engine["chunk_size"]:
+                                boundary_requests.append(request)
+                                fill = 0
+                            else:
+                                _send_intermediate_response(conn, engine, request)
+
+                    outputs = _process_ready_outputs(engine, args.prompt)
+                    for output in outputs:
+                        if not boundary_requests:
+                            break
+                        request = boundary_requests.pop(0)
+                        if output is not None:
+                            ready_time = time.perf_counter()
+                            if engine.get("first_output_time") is None:
+                                engine["first_output_time"] = ready_time
+                            engine["last_output_time"] = ready_time
+                            engine["latency_sum_ms"] += (ready_time - request["received_time"]) * 1000.0
+                            engine["latency_count"] += 1
+                            engine["metrics_output_count"] += 1
+                            _send_response(conn, engine, request, output, stylized_ready=True, reuse_latest=False)
+                        else:
+                            _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
+                except (OSError, ConnectionError):
+                    break
+    finally:
+        server.close()
+        write_metrics(engine)
 
 
+# Run file engine
 def run_engine(engine, image: Image.Image, prompt: str, negative_prompt: str):
     if isinstance(engine, dict) and engine.get("backend") == "streamv2v_real":
-        resized = image.convert("RGB").resize((engine["width"], engine["height"]), Image.Resampling.BILINEAR)
-        frame = np.array(resized, dtype=np.uint8)
+        frame = np.array(image.convert("RGB"), dtype=np.uint8)
         engine["frame_buffer"].append(frame)
 
         if not engine["initialized"]:
             if len(engine["frame_buffer"]) < engine["priming_frames"]:
                 return engine["last_output"], False
-            out_img = _initialize_stream_engine(engine, prompt)
+            out_img = start_real_stream(engine, prompt)
             return out_img if out_img is not None else engine["last_output"], out_img is not None
 
         if len(engine["frame_buffer"]) < engine["chunk_size"]:
             return engine["last_output"], False
 
-        out_img = _step_stream_engine(engine)
+        out_img = step_real_stream(engine)
         return out_img if out_img is not None else engine["last_output"], out_img is not None
 
     if isinstance(engine, dict) and engine.get("backend") == "streamv2v":
@@ -553,33 +673,10 @@ def run_engine(engine, image: Image.Image, prompt: str, negative_prompt: str):
                             pass
                 except Exception:
                     pass
-    raise RuntimeError("no callable inference method on streamdiffusionv2 engine")
+    raise RuntimeError()
 
 
-def save_output(output, output_path: Path):
-    if output_path is None:
-        return
-    if isinstance(output, Image.Image):
-        output.save(output_path)
-        return
-    if isinstance(output, np.ndarray):
-        arr = output
-        if arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-        Image.fromarray(arr).save(output_path)
-        return
-    if isinstance(output, (list, tuple)) and output:
-        first = output[0]
-        if isinstance(first, Image.Image):
-            first.save(output_path)
-            return
-        if isinstance(first, np.ndarray):
-            arr = first
-            if arr.dtype != np.uint8:
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-            Image.fromarray(arr).save(output_path)
-
-
+# Parse cli args
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="")
@@ -588,7 +685,6 @@ def main():
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--output", default="")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--ready-flag", default="")
     parser.add_argument("--real-v2", action="store_true")
@@ -614,13 +710,12 @@ def main():
     args = parser.parse_args()
 
     input_path = Path(args.input) if args.input else None
-    output_path = Path(args.output) if args.output else None
     ready_flag_path = Path(args.ready_flag) if args.ready_flag else None
     interval = 1.0 / args.fps if args.fps > 0 else 0.1
 
     if args.real_v2:
         if not args.config_path or not args.checkpoint_folder:
-            raise RuntimeError("--real-v2 requires --config-path and --checkpoint-folder")
+            raise RuntimeError()
     engine = build_engine(args.model_id, args.prompt, args.negative_prompt, args.device, args)
     if ready_flag_path is not None:
         ready_flag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -637,10 +732,9 @@ def main():
                 if mtime > last_mtime:
                     img = Image.open(input_path).convert("RGB")
                     out, _ = run_engine(engine, img, args.prompt, args.negative_prompt)
-                    out_array = output_to_rgb_array(out)
+                    out_array = to_rgb_frame(out)
                     if out_array is not None:
                         out = maybe_apply_superres_rgb_array(engine, out_array)
-                    save_output(out, output_path)
                     last_mtime = mtime
                     if args.once:
                         break

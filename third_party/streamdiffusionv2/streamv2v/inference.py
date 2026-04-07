@@ -174,7 +174,7 @@ class SingleGPUInferencePipeline:
             current_start=current_start,
             current_end=current_end,
         )
-        initial_video = self._decode_video_array(denoised_pred, last_frame_only=False)
+        initial_video = self._decode_video_array(denoised_pred, last_frame_only=True)
 
         session = SingleGPUStreamSession(
             prompt=prompt,
