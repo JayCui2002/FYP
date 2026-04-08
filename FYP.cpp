@@ -97,7 +97,6 @@ struct ShadowFramebuffer {
 
 static int windowWidth = 1536;
 static int windowHeight = 512;
-static bool showStylized = false;
 static int originalPanelX = 0;
 static int originalPanelY = 0;
 static int originalPanelWidth = 0;
@@ -127,6 +126,7 @@ struct StreamPendingInput {
     std::vector<unsigned char> rgb;
     int side = 0;
     uint32_t seq = 0;
+    std::chrono::steady_clock::time_point capturedAt{};
 };
 
 struct StreamSharedState {
@@ -151,7 +151,9 @@ static const uint32_t kStreamResponseFlagStylizedReady = 1u;
 static const uint32_t kStreamResponseFlagReuseLatest = 2u;
 static constexpr size_t kMaxPendingStreamInputs = 4;
 static constexpr size_t kStreamCaptureBackpressureThreshold = 2;
+static constexpr auto kMaxPendingInputAge = std::chrono::seconds(2);
 static constexpr float kStreamInputJpegQuality = 0.75f;
+static constexpr float kDisplayBlendDurationSec = 0.12f;
 
 static glm::vec3 lookat(0.0f, 0.0f, 0.0f);
 static glm::vec3 up(0.0f, 1.0f, 0.0f);
@@ -200,6 +202,13 @@ static void updateCameraFromSpherical() {
     updateLightFromCursor();
 }
 
+// Drop stale frames
+static void pruneStalePendingInputs(std::deque<StreamPendingInput>& pendingInputs, const std::chrono::steady_clock::time_point now) {
+    while (!pendingInputs.empty() && now - pendingInputs.front().capturedAt > kMaxPendingInputAge) {
+        pendingInputs.pop_front();
+    }
+}
+
 // Handle mouse light
 static void cursor_callback(GLFWwindow* window, double xpos, double ypos) {
     (void)window;
@@ -225,10 +234,6 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
     if (key == GLFW_KEY_ESCAPE) {
         glfwSetWindowShouldClose(window, GL_TRUE);
-        return;
-    }
-    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
-        showStylized = !showStylized;
         return;
     }
     if (key == GLFW_KEY_R && action == GLFW_PRESS) {
@@ -624,6 +629,18 @@ static void updateStylizedTextureFromMemory(const std::vector<unsigned char>& rg
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
 }
 
+// Blend rgb frames
+static std::vector<unsigned char> blendRgbFrames(const std::vector<unsigned char>& from, const std::vector<unsigned char>& to, float alpha) {
+    if (from.size() != to.size()) return to;
+    const float t = std::clamp(alpha, 0.0f, 1.0f);
+    std::vector<unsigned char> blended(to.size());
+    for (size_t i = 0; i < to.size(); ++i) {
+        const float v = static_cast<float>(from[i]) * (1.0f - t) + static_cast<float>(to[i]) * t;
+        blended[i] = static_cast<unsigned char>(std::clamp(std::lround(v), 0l, 255l));
+    }
+    return blended;
+}
+
 // Draw panel quad
 static void drawTexturePanel(GLuint quadProgram, GLuint quadVAO, GLuint texture, int x, int y, int width, int height) {
     if (texture == 0 || width <= 0 || height <= 0) return;
@@ -740,6 +757,8 @@ static void streamSendLoop(SOCKET sock, StreamSharedState* shared) {
         {
             std::lock_guard<std::mutex> lock(shared->mutex);
             if (shared->stop) break;
+            const auto now = std::chrono::steady_clock::now();
+            pruneStalePendingInputs(shared->pendingInputs, now);
             if (!shared->pendingInputs.empty()) {
                 StreamPendingInput pending = std::move(shared->pendingInputs.front());
                 shared->pendingInputs.pop_front();
@@ -1415,6 +1434,24 @@ int main() {
     streamReceiveThread = std::thread(streamReceiveLoop, streamSocket, &sharedState);
     bool hasStylizedFrame = false;
     bool hasSuperresFrame = false;
+    std::vector<unsigned char> displayedStylizedFrame;
+    int displayedStylizedWidth = 0;
+    int displayedStylizedHeight = 0;
+    std::vector<unsigned char> displayedSuperresFrame;
+    int displayedSuperresWidth = 0;
+    int displayedSuperresHeight = 0;
+    std::vector<unsigned char> blendFromStylizedFrame;
+    std::vector<unsigned char> blendToStylizedFrame;
+    int blendStylizedWidth = 0;
+    int blendStylizedHeight = 0;
+    std::vector<unsigned char> blendFromSuperresFrame;
+    std::vector<unsigned char> blendToSuperresFrame;
+    int blendSuperresWidth = 0;
+    int blendSuperresHeight = 0;
+    bool stylizedBlendActive = false;
+    bool superresBlendActive = false;
+    auto stylizedBlendStart = std::chrono::steady_clock::now();
+    auto superresBlendStart = std::chrono::steady_clock::now();
     int activePanelCount = panelCount;
     int displayedOutputFps = 0;
     int displayedNewOutputFps = 0;
@@ -1438,6 +1475,7 @@ int main() {
             bool allowCapture = false;
             {
                 std::lock_guard<std::mutex> lock(sharedState.mutex);
+                pruneStalePendingInputs(sharedState.pendingInputs, nowCapture);
                 allowCapture = sharedState.pendingInputs.size() < kStreamCaptureBackpressureThreshold;
             }
             if (allowCapture) {
@@ -1467,10 +1505,13 @@ int main() {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             if (captureFrameFromFramebuffer(captureFramebuffer, captured, captureSide)) {
                 std::lock_guard<std::mutex> lock(sharedState.mutex);
+                const auto capturedAt = std::chrono::steady_clock::now();
+                pruneStalePendingInputs(sharedState.pendingInputs, capturedAt);
                 StreamPendingInput pending{};
                 pending.rgb = std::move(captured);
                 pending.side = captureSide;
                 pending.seq = nextCaptureSeq++;
+                pending.capturedAt = capturedAt;
                 if (sharedState.pendingInputs.size() >= kMaxPendingStreamInputs) {
                     sharedState.pendingInputs.pop_front();
                 }
@@ -1480,15 +1521,89 @@ int main() {
             lastCaptureTime = nowCapture;
         }
         {
-            std::lock_guard<std::mutex> lock(sharedState.mutex);
-            if (sharedState.hasNewOutput) {
-                updateStylizedTextureFromMemory(sharedState.latestStylizedOutput, sharedState.stylizedWidth, sharedState.stylizedHeight, stylizedTex);
-                if (!sharedState.latestSuperresOutput.empty()) {
-                    updateStylizedTextureFromMemory(sharedState.latestSuperresOutput, sharedState.superresWidth, sharedState.superresHeight, superresTex);
+            std::vector<unsigned char> newStylizedFrame;
+            int newStylizedWidth = 0;
+            int newStylizedHeight = 0;
+            std::vector<unsigned char> newSuperresFrame;
+            int newSuperresWidth = 0;
+            int newSuperresHeight = 0;
+            bool gotNewOutput = false;
+            {
+                std::lock_guard<std::mutex> lock(sharedState.mutex);
+                if (sharedState.hasNewOutput) {
+                    newStylizedFrame = sharedState.latestStylizedOutput;
+                    newStylizedWidth = sharedState.stylizedWidth;
+                    newStylizedHeight = sharedState.stylizedHeight;
+                    newSuperresFrame = sharedState.latestSuperresOutput;
+                    newSuperresWidth = sharedState.superresWidth;
+                    newSuperresHeight = sharedState.superresHeight;
+                    sharedState.hasNewOutput = false;
+                    gotNewOutput = true;
+                }
+            }
+            if (gotNewOutput) {
+                if (!displayedStylizedFrame.empty() &&
+                    displayedStylizedWidth == newStylizedWidth &&
+                    displayedStylizedHeight == newStylizedHeight) {
+                    blendFromStylizedFrame = displayedStylizedFrame;
+                    blendToStylizedFrame = std::move(newStylizedFrame);
+                    blendStylizedWidth = newStylizedWidth;
+                    blendStylizedHeight = newStylizedHeight;
+                    stylizedBlendStart = std::chrono::steady_clock::now();
+                    stylizedBlendActive = true;
+                } else {
+                    displayedStylizedFrame = std::move(newStylizedFrame);
+                    displayedStylizedWidth = newStylizedWidth;
+                    displayedStylizedHeight = newStylizedHeight;
+                    updateStylizedTextureFromMemory(displayedStylizedFrame, displayedStylizedWidth, displayedStylizedHeight, stylizedTex);
+                    stylizedBlendActive = false;
+                }
+                hasStylizedFrame = true;
+                if (!newSuperresFrame.empty()) {
+                    if (!displayedSuperresFrame.empty() &&
+                        displayedSuperresWidth == newSuperresWidth &&
+                        displayedSuperresHeight == newSuperresHeight) {
+                        blendFromSuperresFrame = displayedSuperresFrame;
+                        blendToSuperresFrame = std::move(newSuperresFrame);
+                        blendSuperresWidth = newSuperresWidth;
+                        blendSuperresHeight = newSuperresHeight;
+                        superresBlendStart = std::chrono::steady_clock::now();
+                        superresBlendActive = true;
+                    } else {
+                        displayedSuperresFrame = std::move(newSuperresFrame);
+                        displayedSuperresWidth = newSuperresWidth;
+                        displayedSuperresHeight = newSuperresHeight;
+                        updateStylizedTextureFromMemory(displayedSuperresFrame, displayedSuperresWidth, displayedSuperresHeight, superresTex);
+                        superresBlendActive = false;
+                    }
                     hasSuperresFrame = true;
                 }
-                sharedState.hasNewOutput = false;
-                hasStylizedFrame = true;
+            }
+            if (stylizedBlendActive) {
+                const float alpha = std::chrono::duration<float>(std::chrono::steady_clock::now() - stylizedBlendStart).count() / kDisplayBlendDurationSec;
+                if (alpha >= 1.0f) {
+                    displayedStylizedFrame = std::move(blendToStylizedFrame);
+                    displayedStylizedWidth = blendStylizedWidth;
+                    displayedStylizedHeight = blendStylizedHeight;
+                    updateStylizedTextureFromMemory(displayedStylizedFrame, displayedStylizedWidth, displayedStylizedHeight, stylizedTex);
+                    stylizedBlendActive = false;
+                } else {
+                    std::vector<unsigned char> blended = blendRgbFrames(blendFromStylizedFrame, blendToStylizedFrame, alpha);
+                    updateStylizedTextureFromMemory(blended, blendStylizedWidth, blendStylizedHeight, stylizedTex);
+                }
+            }
+            if (superresBlendActive) {
+                const float alpha = std::chrono::duration<float>(std::chrono::steady_clock::now() - superresBlendStart).count() / kDisplayBlendDurationSec;
+                if (alpha >= 1.0f) {
+                    displayedSuperresFrame = std::move(blendToSuperresFrame);
+                    displayedSuperresWidth = blendSuperresWidth;
+                    displayedSuperresHeight = blendSuperresHeight;
+                    updateStylizedTextureFromMemory(displayedSuperresFrame, displayedSuperresWidth, displayedSuperresHeight, superresTex);
+                    superresBlendActive = false;
+                } else {
+                    std::vector<unsigned char> blended = blendRgbFrames(blendFromSuperresFrame, blendToSuperresFrame, alpha);
+                    updateStylizedTextureFromMemory(blended, blendSuperresWidth, blendSuperresHeight, superresTex);
+                }
             }
         }
         const int desiredPanelCount = (config.streamV2UseSuperres || hasSuperresFrame) ? 3 : 2;

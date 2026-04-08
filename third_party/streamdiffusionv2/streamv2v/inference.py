@@ -94,6 +94,7 @@ class SingleGPUInferencePipeline:
         self.processed_offset = 3
         self.base_chunk_size = 4
         self.t_refresh = 50
+        self.refresh_history_frames = 1 + 2 * self.base_chunk_size * self.pipeline.num_frame_per_block
 
         self.t2v = config.t2v
         self.profile = bool(config.get("profile", False))
@@ -186,11 +187,19 @@ class SingleGPUInferencePipeline:
             last_image=images[:, :, [-1]],
             processed=0,
         )
+        history_window = max(self.refresh_history_frames, chunk_size + 1)
+        session.history_images = images[:, :, -history_window:].clone()
         return session, initial_video
 
     def _refresh_stream_session(self, session: SingleGPUStreamSession, images: torch.Tensor) -> tuple[SingleGPUStreamSession, np.ndarray]:
         """Rebuild the stream session from the latest frame block before KV refresh boundaries."""
-        refresh_images = torch.cat([session.last_image, images], dim=2)
+        history_window = max(self.refresh_history_frames, session.chunk_size + 1)
+        refresh_seed = getattr(session, "history_images", None)
+        if refresh_seed is None:
+            refresh_seed = session.last_image
+        refresh_images = torch.cat([refresh_seed, images], dim=2)
+        if refresh_images.shape[2] > history_window:
+            refresh_images = refresh_images[:, :, -history_window:]
         refreshed_session, refresh_video = self.start_stream_session(
             session.prompt,
             refresh_images,
@@ -242,6 +251,13 @@ class SingleGPUInferencePipeline:
 
         session.last_image = images[:, :, [-1]]
         session.noise_scale = noise_scale
+        history_window = max(self.refresh_history_frames, session.chunk_size + 1)
+        history_images = getattr(session, "history_images", None)
+        if history_images is None:
+            history_images = session.last_image
+        session.history_images = torch.cat([history_images, images], dim=2)
+        if session.history_images.shape[2] > history_window:
+            session.history_images = session.history_images[:, :, -history_window:]
         return outputs
     
     def run_inference(

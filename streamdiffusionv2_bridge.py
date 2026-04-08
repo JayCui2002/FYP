@@ -34,9 +34,18 @@ def write_metrics(engine):
     if not isinstance(engine, dict):
         return
     path = Path(__file__).resolve().parent / DEFAULT_METRICS_OUTPUT
+    first_request_time = engine.get("first_request_time")
     first_output_time = engine.get("first_output_time")
     last_output_time = engine.get("last_output_time")
     metrics_output_count = int(engine.get("metrics_output_count", 0))
+    if (
+        first_request_time is not None
+        and first_output_time is not None
+        and first_output_time >= first_request_time
+    ):
+        first_frame_time_ms = (first_output_time - first_request_time) * 1000.0
+    else:
+        first_frame_time_ms = 0.0
     if (
         first_output_time is not None
         and last_output_time is not None
@@ -46,15 +55,30 @@ def write_metrics(engine):
         average_fps = (metrics_output_count - 1) / (last_output_time - first_output_time)
     else:
         average_fps = 0.0
+    first_ready_time = engine.get("first_ready_time")
+    last_ready_time = engine.get("last_ready_time")
+    ready_response_count = int(engine.get("ready_response_count", 0))
+    if (
+        first_ready_time is not None
+        and last_ready_time is not None
+        and last_ready_time > first_ready_time
+        and ready_response_count > 1
+    ):
+        display_fps = (ready_response_count - 1) / (last_ready_time - first_ready_time)
+    else:
+        display_fps = 0.0
     latency_count = int(engine.get("latency_count", 0))
     if latency_count > 0:
         average_latency_ms = float(engine.get("latency_sum_ms", 0.0)) / latency_count
     else:
         average_latency_ms = 0.0
     text = (
+        f"first_frame_time_ms={first_frame_time_ms:.4f}\n"
         f"average_output_fps={average_fps:.4f}\n"
+        f"display_fps={display_fps:.4f}\n"
         f"average_latency_ms={average_latency_ms:.4f}\n"
         f"output_frames={metrics_output_count}\n"
+        f"ready_frames={ready_response_count}\n"
         f"latency_samples={latency_count}\n"
     )
     try:
@@ -126,11 +150,9 @@ def build_superres(args, torch_module, runtime_device):
         device=runtime_device,
     )
     return {
-        "backend": DEFAULT_SR_MODEL,
         "upsampler": upsampler,
         "scale": 2,
         "enabled": True,
-        "output_count": 0,
     }
 
 
@@ -148,7 +170,6 @@ def maybe_apply_superres_rgb_array(engine, rgb_array):
     bgr = np.ascontiguousarray(rgb[:, :, ::-1])
     output_bgr, _ = superres["upsampler"].enhance(bgr, outscale=superres["scale"])
     output_rgb = np.ascontiguousarray(output_bgr[:, :, ::-1])
-    superres["output_count"] += 1
     return output_rgb
 
 
@@ -227,8 +248,12 @@ def build_engine(model_id: str, prompt: str, negative_prompt: str, device: str, 
             "cached_stylized_size": None,
             "cached_superres_frame": None,
             "cached_superres_size": None,
+            "first_request_time": None,
             "first_output_time": None,
             "last_output_time": None,
+            "first_ready_time": None,
+            "last_ready_time": None,
+            "ready_response_count": 0,
             "latency_sum_ms": 0.0,
             "latency_count": 0,
             "metrics_output_count": 0,
@@ -424,17 +449,10 @@ def step_real_stream(engine):
             session.last_image = inp[:, :, [-1]].clone()
             session.noise_scale = noise_scale
     elif session.current_start // manager.pipeline.frame_seq_length >= engine["t_refresh"]:
-        refresh_images = engine["torch"].cat([session.last_image, inp], dim=2)
         with engine["torch"].inference_mode():
-            refreshed_session, refresh_video = manager.start_stream_session(
-                session.prompt,
-                refresh_images,
-                float(session.noise_scale),
-            )
-        refreshed_session.processed = len(manager.pipeline.denoising_step_list)
-        manager.processed = refreshed_session.processed
+            refreshed_session, _ = manager._refresh_stream_session(session, inp)
         session = refreshed_session
-        out_img = decode_last_image(refresh_video[[-1]] if refresh_video is not None else None)
+        out_img = None
     else:
         noisy_latents = manager._encode_noisy_latents(inp, noise_scale)
         with engine["torch"].inference_mode():
@@ -453,6 +471,13 @@ def step_real_stream(engine):
         session.current_end += (session.chunk_size // manager.base_chunk_size) * manager.pipeline.frame_seq_length
         session.last_image = inp[:, :, [-1]].clone()
         session.noise_scale = noise_scale
+        history_window = max(getattr(manager, "refresh_history_frames", 0), session.chunk_size + 1)
+        history_images = getattr(session, "history_images", None)
+        if history_images is None:
+            history_images = session.last_image
+        session.history_images = engine["torch"].cat([history_images, inp], dim=2)
+        if session.history_images.shape[2] > history_window:
+            session.history_images = session.history_images[:, :, -history_window:]
     engine["session"] = session
     engine["noise_scale"] = float(session.noise_scale)
     if out_img is not None:
@@ -492,17 +517,6 @@ def _cache_ready_frames(engine, output):
         engine["cached_superres_size"] = None
 
     return stylized_frame, superres_frame
-
-
-# Check refresh boundary
-def _refresh_pending(engine):
-    if not engine.get("initialized"):
-        return False
-    session = engine.get("session")
-    if session is None:
-        return False
-    frame_seq_length = int(engine["manager"].pipeline.frame_seq_length)
-    return int(session.current_start) // frame_seq_length >= int(engine["t_refresh"])
 
 
 # Send output packet
@@ -552,14 +566,16 @@ def _send_response(conn, engine, request, output=None, stylized_ready=False, reu
     if superres_response:
         conn.sendall(superres_response)
     if stylized_ready:
+        ready_time = time.perf_counter()
+        if engine.get("first_ready_time") is None:
+            engine["first_ready_time"] = ready_time
+        engine["last_ready_time"] = ready_time
+        engine["ready_response_count"] = int(engine.get("ready_response_count", 0)) + 1
         log_ready(request["seq"], reuse_latest)
 
 
 # Send reuse packet
 def _send_intermediate_response(conn, engine, request):
-    if _refresh_pending(engine):
-        _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
-        return
     if engine.get("cached_stylized_frame") is not None:
         _send_response(conn, engine, request, stylized_ready=True, reuse_latest=True)
         return
@@ -590,6 +606,8 @@ def serve_socket(engine, args):
                 fill = len(engine["frame_buffer"])
                 try:
                     for request in requests:
+                        if engine.get("first_request_time") is None:
+                            engine["first_request_time"] = request["received_time"]
                         engine["frame_buffer"].append(request["rgb"])
 
                         if not classified_initialized:
@@ -623,7 +641,10 @@ def serve_socket(engine, args):
                             engine["metrics_output_count"] += 1
                             _send_response(conn, engine, request, output, stylized_ready=True, reuse_latest=False)
                         else:
-                            _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
+                            if engine.get("cached_stylized_frame") is not None:
+                                _send_response(conn, engine, request, stylized_ready=True, reuse_latest=True)
+                            else:
+                                _send_response(conn, engine, request, stylized_ready=False, reuse_latest=False)
                 except (OSError, ConnectionError):
                     break
     finally:
