@@ -1,0 +1,36 @@
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: streamdiffusionv2-bridge
+    restart: unless-stopped
+    gpus: all
+    working_dir: /app
+    ports:
+      - "${STREAM_PORT:-8765}:${STREAM_PORT:-8765}"
+    environment:
+      STREAM_PORT: "${STREAM_PORT:-8765}"
+      STREAM_CONFIG_PATH: "${STREAM_CONFIG_PATH:-/app/input/streamv2v_config.yaml}"
+      STREAM_CHECKPOINT_FOLDER: "${STREAM_CHECKPOINT_FOLDER:-/models/ckpts/wan_causal_dmd_v2v}"
+      STREAM_HEIGHT: "${STREAM_HEIGHT:-512}"
+      STREAM_WIDTH: "${STREAM_WIDTH:-512}"
+      STREAM_STEP: "${STREAM_STEP:-2}"
+      STREAM_NOISE_SCALE: "${STREAM_NOISE_SCALE:-0.85}"
+      STREAM_PROMPT: "${STREAM_PROMPT:-golden vase}"
+      STREAM_NEGATIVE_PROMPT: "${STREAM_NEGATIVE_PROMPT:-}"
+      STREAM_DEVICE: "${STREAM_DEVICE:-cuda}"
+      STREAM_USE_SR: "${STREAM_USE_SR:-0}"
+      STREAM_STREAM_WO_BATCH: "${STREAM_STREAM_WO_BATCH:-0}"
+      STREAM_USE_TAEHV: "${STREAM_USE_TAEHV:-0}"
+      STREAM_SR_MODEL_PATH: "${STREAM_SR_MODEL_PATH:-}"
+      STREAM_SR_TILE: "${STREAM_SR_TILE:-0}"
+      STREAM_MODEL_TYPE: "${STREAM_MODEL_TYPE:-T2V-1.3B}"
+      STREAM_NUM_FRAMES: "${STREAM_NUM_FRAMES:-81}"
+    volumes:
+      - ./:/app
+      - ${STREAM_CKPT_ROOT:-./ckpts}:/models/ckpts
+      - ${STREAM_WAN_MODELS_ROOT:-./third_party/streamdiffusionv2/wan_models}:/app/wan_models
+      - ${STREAM_SR_MODELS_ROOT:-./sr_models}:/app/sr_models
+    stdin_open: true
+    tty: true

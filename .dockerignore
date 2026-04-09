@@ -1,0 +1,12 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.o
+*.exe
+fyp.exe
+FYP.o
+codex-temp.index
+codex-export-fyp*
+_docx*/

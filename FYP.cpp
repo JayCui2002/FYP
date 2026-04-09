@@ -42,6 +42,7 @@ struct SceneConfig {
     std::string texturePath;
     float streamInputFps = 10.0f;
     bool streamV2Autostart = false;
+    std::string streamV2Host = "127.0.0.1";
     std::string streamV2Python = "python";
     std::string streamV2Script = "streamdiffusionv2_bridge.py";
     std::string streamV2Args;
@@ -352,6 +353,8 @@ static bool loadSceneConfig(const std::string& filePath, SceneConfig& cfg) {
             cfg.streamV2Python = value;
         } else if (key == "stream_v2_script") {
             cfg.streamV2Script = value;
+        } else if (key == "stream_v2_host") {
+            cfg.streamV2Host = value;
         } else if (key == "stream_v2_args") {
             cfg.streamV2Args = value;
         } else if (key == "stream_v2_port") {
@@ -381,6 +384,7 @@ static void launchStreamV2Bridge(const SceneConfig& cfg) {
     cmd << "start \"\" /B "
         << quoteArg(cfg.streamV2Python) << " "
         << quoteArg(cfg.streamV2Script)
+        << " --host " << quoteArg(cfg.streamV2Host)
         << " --port " << cfg.streamV2Port
         << " --fps " << cfg.streamInputFps;
     if (!cfg.streamV2Args.empty()) cmd << " " << cfg.streamV2Args;
@@ -725,22 +729,31 @@ static SOCKET connectToStreamV2(const SceneConfig& cfg) {
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return INVALID_SOCKET;
     const auto timeout = std::chrono::duration<float>((cfg.streamV2WaitTimeoutSec > 0.0f) ? cfg.streamV2WaitTimeoutSec : 120.0f);
     const auto begin = std::chrono::steady_clock::now();
+    const std::string host = cfg.streamV2Host.empty() ? "127.0.0.1" : cfg.streamV2Host;
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* resolved = nullptr;
+    const std::string port = std::to_string(cfg.streamV2Port);
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &resolved) != 0 || resolved == nullptr) {
+        WSACleanup();
+        return INVALID_SOCKET;
+    }
     while (std::chrono::steady_clock::now() - begin < timeout) {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) break;
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(static_cast<u_short>(cfg.streamV2Port));
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+        if (connect(sock, resolved->ai_addr, static_cast<int>(resolved->ai_addrlen)) == 0) {
             DWORD timeoutMs = 300000;
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
             setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+            freeaddrinfo(resolved);
             return sock;
         }
         closesocket(sock);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    freeaddrinfo(resolved);
     WSACleanup();
     return INVALID_SOCKET;
 }
